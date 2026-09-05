@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+title: "The Replay Lattice: A Type System for Floating-Point Reproducibility"
+message: "If you use this software or its results, please cite the paper below."
+type: software
+authors:
+  - family-names: Haddon
+    given-names: Michael
+    email: michael@politepixels.io
+repository-code: "https://github.com/politepixels/replay-lattice-paper"
+abstract: >-
+  The artefact behind the paper: lanelang, a demonstration language whose values carry a
+  determinism class joined over the whole dependency path, checked at every declaration,
+  and discharged into backend lowering obligations, together with the checker, evaluator,
+  fixtures, fuzzer, must-fail controls and Coq mechanisation.
+keywords:
+  - floating point
+  - reproducibility
+  - determinism
+  - type systems
+  - parallel reduction
+license: Apache-2.0
+version: 0.2.0
+date-released: 2026-09-05
+doi: 10.5281/zenodo.22333026
+preferred-citation:
+  type: article
+  title: "The Replay Lattice: A Type System for Floating-Point Reproducibility"
+  authors:
+    - family-names: Haddon
+      given-names: Michael
+  year: 2026
+  notes: "The type system: the demand, the join, the soundness theorem, the checker."

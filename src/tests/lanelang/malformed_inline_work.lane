@@ -1,0 +1,43 @@
+// Copyright 2026 PolitePixels Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package app
+
+// EXPECT: malformed
+func f0(a Float) Float { return a + a }
+func f1(a Float) Float { return f0(a) + f0(a * 2.0) }
+func f2(a Float) Float { return f1(a) + f1(a * 2.0) }
+func f3(a Float) Float { return f2(a) + f2(a * 2.0) }
+func f4(a Float) Float { return f3(a) + f3(a * 2.0) }
+func f5(a Float) Float { return f4(a) + f4(a * 2.0) }
+func f6(a Float) Float { return f5(a) + f5(a * 2.0) }
+func f7(a Float) Float { return f6(a) + f6(a * 2.0) }
+func f8(a Float) Float { return f7(a) + f7(a * 2.0) }
+func f9(a Float) Float { return f8(a) + f8(a * 2.0) }
+func f10(a Float) Float { return f9(a) + f9(a * 2.0) }
+func f11(a Float) Float { return f10(a) + f10(a * 2.0) }
+func f12(a Float) Float { return f11(a) + f11(a * 2.0) }
+func f13(a Float) Float { return f12(a) + f12(a * 2.0) }
+func f14(a Float) Float { return f13(a) + f13(a * 2.0) }
+func f15(a Float) Float { return f14(a) + f14(a * 2.0) }
+func f16(a Float) Float { return f15(a) + f15(a * 2.0) }
+func f17(a Float) Float { return f16(a) + f16(a * 2.0) }
+func f18(a Float) Float { return f17(a) + f17(a * 2.0) }
+func f19(a Float) Float { return f18(a) + f18(a * 2.0) }
+
+func main() Float {
+    x := indices(count: 10.0)
+    approx total := f19(sum(x))
+    return total
+}

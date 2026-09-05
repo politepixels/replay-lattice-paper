@@ -1,0 +1,7 @@
+build/
+src/proofs/*.vo
+src/proofs/*.vok
+src/proofs/*.vos
+src/proofs/*.glob
+src/proofs/.*.aux
+src/proofs/.lia.cache
