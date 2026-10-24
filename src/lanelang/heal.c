@@ -37,7 +37,7 @@
 // a lane the kernel never honours: a scan given a fold's class reads as pinned to the
 // checker and still lowers to the free kernel, a silent wrong answer rather than a
 // refusal. The offer is the strongest class the family has, not always the one asked for:
-// the scan family has no oracle-order kernel, so an `exact` demand on a scan is offered
+// this build routes no `exact` demand to a scan, so such a demand is offered
 // the blocked class, whose lane is `replay`, and the refusal then comes from
 // lattice_check comparing `replay` against the demand rather than from this function
 // declining to pin. The blocked scan's bits are a function of (data, shape) alone, so the
@@ -146,12 +146,12 @@ static int mark_inputs_escaping(const dag_t *g, const int at, const int root,
 // A producer is private to a demand when nothing outside that demand can observe a change
 // to it, and the rule is a closure because one neutral binding can hide an escape: with
 // `p := sum(x*0.5)` feeding only `a := p + 1.0` inside the cone, `p` would be pinned
-// while `a` is also read outside it, so the bits an outsider observes move. The cut at
-// the root matters, because without it every demand whose own result feeds anything else
-// would mark its whole cone as escaping and heal nothing, and a change that reaches an
-// outsider only through the demanded value is licensed by the annotation. A fixpoint
-// rather than one sweep, because the carried edge may point forward, so escape can travel
-// from a later index to an earlier one and back.
+// while `a` is also read outside it, so the bits an outsider observes move. The path is
+// cut at the root, because without the cut every demand whose own result feeds anything
+// else would mark its whole cone as escaping and heal nothing, and a change that reaches
+// an outsider only through the demanded value is licensed by the annotation. The marking
+// runs to a fixpoint rather than one sweep, because the carried edge may point forward,
+// so escape can travel from a later index to an earlier one and back.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -191,7 +191,7 @@ static void pin_cone(dag_t *g, const int count, const int at, const lane_t want,
     }
     seen[at] = 1;
     dagnode_t *node = dag_at(g, at);
-    if (node->declared != LANE_NONE && node->declared != want) {
+    if (node->declared != LANE_NONE && node->declared != want && node->stated_by_binding) {
         return;
     }
 
@@ -244,8 +244,8 @@ static int count_changed(dag_t *g, const int *classes, const int recorded) {
 // so `escapes` is seeded at `result` before the walk. Left unseeded, a demand that
 // reaches that value from the side would pin a producer whose bits the caller observes,
 // and adding a binding nobody reads would change the number the program computed. The cut
-// at the root still applies, so a demand on the value handed back licenses its own change
-// exactly as before.
+// at the root still applies, so a demand on the value handed back licenses its own
+// change.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.

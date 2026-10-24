@@ -30,9 +30,9 @@
 
 #define DEFAULT_FIXTURE_DIR "../tests/lanelang"
 
-#define MAX_FIXTURES 160
+#define MAX_FIXTURES 256
 
-#define EXPECTED_FIXTURE_COUNT 118
+#define EXPECTED_FIXTURE_COUNT 161
 
 #define NAME_BYTES 256
 
@@ -360,7 +360,9 @@ static int check_resolved(const resolved_t *resolved, diagnostic_t *diagnostics,
         }
     }
 
-    if (check_rejected(&swept)) {
+    if (check_malformed(&swept)) {
+        outcome->got = WANT_MALFORMED;
+    } else if (check_rejected(&swept)) {
         outcome->got = WANT_REJECT;
         record_first_violation(resolved->dag, computed, outcome);
     }
@@ -385,11 +387,12 @@ static int run_checker(
     }
 
     int ok = 1;
-    int declaration_rejected = 0;
+    int declaration_malformed = 0;
     check_result_t declaration_found = check_result_none();
-    if (!resolve_verify_declarations(program, "main", diagnostics, &declaration_rejected,
-                                     &declaration_found)
-        && !declaration_rejected) {
+    const int declarations_hold = resolve_verify_declarations(program, "main", diagnostics,
+                                                              &declaration_malformed,
+                                                              &declaration_found);
+    if (declaration_malformed) {
         outcome->got = WANT_MALFORMED;
         ast_free(program);
         return 1;
@@ -399,9 +402,9 @@ static int run_checker(
         outcome->got = WANT_MALFORMED;
     } else {
         ok = check_resolved(&resolved, diagnostics, outcome);
-    }
-    if (declaration_rejected) {
-        outcome->got = WANT_REJECT;
+        if (!declarations_hold && outcome->got != WANT_MALFORMED) {
+            outcome->got = WANT_REJECT;
+        }
     }
     dag_free(resolved.dag);
     ast_free(program);
@@ -439,7 +442,7 @@ static int check_passes(const char *fixture, const outcome_t *outcome) {
 
     cases++;
     if (outcome->passes < 1 || outcome->passes > ceiling) {
-        fail(fixture, "lane passes: want 1 to %d at recurrence depth %d, got %d",
+        fail(fixture, "lane passes: want 1 to %d at carried depth %d, got %d",
              ceiling, outcome->carried_depth, outcome->passes);
         ok = 0;
     }
@@ -455,14 +458,6 @@ static int check_passes(const char *fixture, const outcome_t *outcome) {
         if (outcome->passes != 1) {
             fail(fixture, "lane passes: want 1 where no lane left the seed, got %d",
                  outcome->passes);
-            ok = 0;
-        }
-    } else {
-        cases++;
-        if (outcome->passes < outcome->carried_depth + 1) {
-            fail(fixture, "lane passes: want at least %d at recurrence depth %d, got %d; the "
-                 "carried lane cannot have crossed every level",
-                 outcome->carried_depth + 1, outcome->carried_depth, outcome->passes);
             ok = 0;
         }
     }

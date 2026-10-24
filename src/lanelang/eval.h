@@ -65,8 +65,8 @@ int eval_dag_in_world(
 // the schedule space is (mode, tile, workers), none of the three can pick a kernel, so a
 // check that varies only the schedule asks whether a value agrees with itself, and a
 // kernel that is deterministic and consistently wrong passes it unremarked. No mode, tile
-// or worker count, because the reference is not a schedule; it is taken at the one point
-// of the space where nothing has been chosen.
+// or worker count, because the reference is not a deployment schedule: it is one extra
+// point beside the deployment's space, taken where nothing has been chosen.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.

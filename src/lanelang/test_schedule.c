@@ -84,6 +84,7 @@ static const char *const PROGRAMS[] = {
     "    %stotal := sum(p - x)\n"
     "    return total\n"
     "}\n",
+
 };
 
 #define NP ((int) (sizeof PROGRAMS / sizeof PROGRAMS[0]))
@@ -702,8 +703,68 @@ static const char INCIDENT_EXACT_PROGRAM[] =
     "    return total\n"
     "}\n";
 
+static const char INCIDENT_DRIFT_PROGRAM[] =
+    "package app\n"
+    "func main() Float {\n"
+    "    x := indices(count: 100000.0)\n"
+    "    approx s := sum(x * 0.5)\n"
+    "    return s\n"
+    "}\n";
+
 #define INCIDENT_THEN_TOTAL 300000.0
 #define INCIDENT_ELSE_TOTAL 500000.0
+#define INCIDENT_RECORDED_SUM 0.0042511812704049134
+
+static int first_differing_digit(const double value, const double recorded) {
+    char got[32];
+    char want[32];
+    snprintf(got, sizeof got, "%.16e", value);
+    snprintf(want, sizeof want, "%.16e", recorded);
+    if (strcmp(strchr(got, 'e'), strchr(want, 'e')) != 0) {
+        return 1;
+    }
+    int digit = 0;
+    for (int i = 0; got[i] && got[i] != 'e'; i++) {
+        if (got[i] == '.') {
+            continue;
+        }
+        digit++;
+        if (got[i] != want[i]) {
+            return digit;
+        }
+    }
+    return 0;
+}
+
+static void report_incident_drift(void) {
+    uint64_t cells[NT * NW];
+    if (evaluate_grid(INCIDENT_DRIFT_PROGRAM, "", cells) < 0) {
+        printf("        drift: the free sum did not evaluate, so nothing is reported\n");
+        return;
+    }
+    const uint64_t recorded = bits_of(INCIDENT_RECORDED_SUM);
+    int kept = 0;
+    int earliest = 0;
+    for (int j = 0; j < NW; j++) {
+        int moved = 0;
+        for (int i = 0; i < NT; i++) {
+            const uint64_t cell = cells[i * NW + j];
+            if (cell == recorded) {
+                continue;
+            }
+            double value;
+            memcpy(&value, &cell, sizeof value);
+            const int digit = first_differing_digit(value, INCIDENT_RECORDED_SUM);
+            if (earliest == 0 || (digit > 0 && digit < earliest)) {
+                earliest = digit;
+            }
+            moved = 1;
+        }
+        kept += !moved;
+    }
+    printf("        drift: the free sum keeps the recorded bits at %d of %d worker counts; "
+           "the rest move it first in significant digit %d\n", kept, NW, earliest);
+}
 
 static void check_incident_flip(run_state_t *state) {
     uint64_t cells[NT * NW];
@@ -736,6 +797,7 @@ static void check_incident_flip(run_state_t *state) {
     }
     printf("  ok    incident: both arms over %d cells; the schedule picked the answer\n",
            NT * NW);
+    report_incident_drift();
 }
 
 static void check_incident_pinned(run_state_t *state, const char *program,
@@ -758,13 +820,14 @@ static void check_incident_pinned(run_state_t *state, const char *program,
         return;
     }
     state->cases++;
-    if (cells[0] != bits_of(INCIDENT_THEN_TOTAL) && cells[0] != bits_of(INCIDENT_ELSE_TOTAL)) {
-        printf("FAIL    %-8s the repair's one value is neither arm\n", label);
+    printf("  ok    %-8s 1 pattern over %d cells\n", label, NT * NW);
+    if (cells[0] != bits_of(INCIDENT_ELSE_TOTAL)) {
+        printf("FAIL    %-8s the repair's one value is not the arm the serial run takes\n", label);
         state->failed++;
-        note_failure(state, "incident-arm-unknown");
+        note_failure(state, "incident-repair-not-serial");
         return;
     }
-    printf("  ok    %-8s 1 pattern over %d cells, and it is an arm\n", label, NT * NW);
+    printf("  ok    %-8s and it is the arm the serial run takes\n", label);
 }
 
 static void check_value(run_state_t *state, const char *program, const double want,
@@ -811,6 +874,43 @@ static void check_program(const int index, const char *template_text, run_state_
     check_pinned(template_text, state);
 }
 
+static const char SCAN_WITNESS_PROGRAM[] =
+    "package app\n"
+    "func main() Float {\n"
+    "    x := indices(count: 1500.0)\n"
+    "    total := sum(scan(x), order: oracle)\n"
+    "    return total\n"
+    "}\n";
+
+static void check_scan_witness(run_state_t *state) {
+    uint64_t patterns[NW];
+    int seen = 0;
+    for (int i = 0; i < NW; i++) {
+        double value = 0.0;
+        size_t columns = 0;
+        size_t tiles = 0;
+        state->cases++;
+        if (!eval_one(SCAN_WITNESS_PROGRAM, "", (schedule_point_t) {EVAL_MATERIALISE, 0, WORKERS[i]},
+                      &value, &columns, &tiles)) {
+            printf("FAIL    %-8s did not build or evaluate\n", "scan");
+            state->failed++;
+            note_failure(state, "schedule-eval-failed");
+            return;
+        }
+        seen = remember_pattern(patterns, seen, NW, bits_of(value));
+    }
+    state->cases++;
+    if (seen > 1) {
+        printf("  ok    %-8s %d pattern(s) over %d worker counts, the fold over it pinned\n",
+               "scan", seen, NW);
+    } else {
+        printf("FAIL    %-8s 1 pattern over %d worker counts with the fold over it pinned; "
+               "nothing witnesses that a free scan depends on the schedule\n", "scan", NW);
+        state->failed++;
+        note_failure(state, "free-scan-not-discriminating");
+    }
+}
+
 static void check_discrimination_floor(run_state_t *state) {
     state->cases++;
     if (state->discriminating * 2 < NP) {
@@ -844,6 +944,7 @@ int main(void) {
     check_reference(&state);
     check_integer_domain(&state);
     check_recurrence_runs(&state);
+    check_scan_witness(&state);
     check_value(&state, TICK_PROGRAM, 6.0, "tick", "tick index");
     check_value(&state, NESTED_TICK_PROGRAM, 12.0, "tick2", "tick index");
     check_value(&state, NESTED_CARRY_PROGRAM, 24.0, "nested", "carried value");

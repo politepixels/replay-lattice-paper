@@ -75,7 +75,10 @@ Proof. reflexivity. Qed.
 Definition kernel_recurrence_by_workers (s : msched) (l : list A) : A :=
   chain (match sworkers s with O => seed | S _ => f seed seed end) l.
 
-Definition kernel_free (s : msched) (l : list A) : A := blocked (S (sworkers s)) l.
+Definition free_width (s : msched) (n : nat) : nat :=
+  let lanes := Nat.max 1 (sworkers s) in Nat.max 1 ((n + lanes - 1) / lanes).
+
+Definition kernel_free (s : msched) (l : list A) : A := blocked (free_width s (length l)) l.
 
 Definition SCANW : nat := 64.
 
@@ -98,7 +101,7 @@ Definition scan_blocked (k : nat) (l : list A) : list A :=
 Definition kernel_scan_fixed (s : msched) (l : list A) : list A := scan_blocked SCANW l.
 
 Definition kernel_scan_by_workers (s : msched) (l : list A) : list A :=
-  scan_blocked (S (sworkers s)) l.
+  scan_blocked (free_width s (length l)) l.
 
 Theorem row_fixed_block_scan :
   forall s s' l, kernel_scan_fixed s l = kernel_scan_fixed s' l.
@@ -112,7 +115,7 @@ Theorem witness_scan_by_workers_moves :
   exists l s s',
     kernel_scan_by_workers nat wf2 0 s l <> kernel_scan_by_workers nat wf2 0 s' l.
 Proof.
-  exists [1; 1; 1; 1], (mkSched 0 0 0), (mkSched 0 0 1).
+  exists [1; 1; 1; 1], (mkSched 0 0 1), (mkSched 0 0 2).
   vm_compute. discriminate.
 Qed.
 
@@ -120,7 +123,7 @@ Theorem witness_free_reduction_moves :
   exists l s s',
     kernel_free nat wf2 0 s l <> kernel_free nat wf2 0 s' l.
 Proof.
-  exists [1; 1; 1; 1], (mkSched 0 0 0), (mkSched 0 0 1).
+  exists [1; 1; 1; 1], (mkSched 0 0 1), (mkSched 0 0 2).
   vm_compute. discriminate.
 Qed.
 
@@ -184,6 +187,12 @@ Definition kernel_oracle (A : Type) (f : A -> A -> A) (seed : A)
 Theorem row_oracle_order_matches_reference :
   forall A f seed s l, kernel_oracle A f seed s l = reference A f seed l.
 Proof. reflexivity. Qed.
+
+Theorem witness_fixed_tree_is_not_reference :
+  exists l, kernel_fixed_tree nat wf2 0 (mkSched 0 0 0) l <> reference nat wf2 0 l.
+Proof.
+  exists (repeat 0 63 ++ [1; 0; 0]). vm_compute. discriminate.
+Qed.
 
 Definition kernel_elementwise (A B : Type) (g : A -> B) (s : msched) (l : list A) : list B :=
   map g l.
@@ -319,7 +328,7 @@ Corollary row_exact_integer_schedule_invariant :
   forall s s' l, Forall dom l -> kernel_free A g e s l = kernel_free A g e s' l.
 Proof.
   intros s s' l Hl. unfold kernel_free.
-  rewrite !row_exact_integer by (lia || exact Hl). reflexivity.
+  rewrite !row_exact_integer by (apply Nat.le_max_l || exact Hl). reflexivity.
 Qed.
 
 End ExactInteger.
@@ -344,7 +353,9 @@ Definition mworld := nat.
 
 Definition mbits := nat.
 
-Definition mgated (s : msched) : Prop := sworkers s = 0.
+Definition ORACLE_MODE : nat := 3.
+
+Definition mgated (s : msched) : Prop := smode s <> ORACLE_MODE.
 
 Definition magrees (l : lane) (s s' : msched) : Prop :=
   match l with
@@ -368,8 +379,10 @@ Fixpoint meval_at (fuel : nat) (P : prog) (i : nat) (s : msched) (w : mworld) : 
             end in
           match op_lane n with
           | Exact  => chain nat Nat.add w (carried_value :: operands)
-          | Replay => kernel_fixed_tree nat Nat.add w s (carried_value :: operands)
-          | Approx => kernel_free nat Nat.add w s (carried_value :: operands)
+          | Replay => if Nat.eqb (smode s) ORACLE_MODE then chain nat Nat.add w (carried_value :: operands)
+                      else kernel_fixed_tree nat Nat.add w s (carried_value :: operands)
+          | Approx => if Nat.eqb (smode s) ORACLE_MODE then chain nat Nat.add w (carried_value :: operands)
+                      else kernel_free nat Nat.add w s (carried_value :: operands)
           end
       end
   end.
@@ -410,13 +423,13 @@ Theorem demo_assumption1 :
 Proof.
   intros i n s s' w Hn Hag Hin Hcar.
   assert (Hlane := f_equal node_lane_of Hn).
-  assert (Hins := f_equal node_inputs_of Hn).
-  unfold demo_prog in Hlane, Hins.
-  destruct i as [| [| [| i]]]; cbn in Hlane, Hins.
+  unfold demo_prog in Hlane.
+  destruct i as [| [| [| i]]]; cbn in Hlane.
   - reflexivity.
-  - rewrite <- Hins in Hin.
-    specialize (Hin 0 (or_introl eq_refl)).
-    unfold meval in Hin |- *. cbn in Hin |- *. congruence.
+  - rewrite <- Hlane in Hag. destruct Hag as [Hg Hg'].
+    apply Nat.eqb_neq in Hg, Hg'.
+    unfold meval. cbn [meval_at nth_error demo_prog op_lane inputs carried map].
+    rewrite Hg, Hg'. reflexivity.
   - rewrite <- Hlane in Hag. cbn in Hag. contradiction.
   - destruct i; unfold meval; cbn; reflexivity.
 Qed.
@@ -424,5 +437,7 @@ Qed.
 Theorem mgated_separates :
   (exists s, mgated s) /\ (exists s, ~ mgated s).
 Proof.
-  split; [ exists (mkSched 0 0 0) | exists (mkSched 0 0 1) ]; simpl; [ reflexivity | discriminate ].
+  split; [ exists (mkSched 0 0 0) | exists (mkSched ORACLE_MODE 0 0) ]; unfold mgated; simpl.
+  - unfold ORACLE_MODE. discriminate.
+  - intros H. apply H. reflexivity.
 Qed.

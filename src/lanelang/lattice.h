@@ -19,7 +19,7 @@
 #include "diagnostic.h"
 #include "lane.h"
 
-// BLAME_PATH_MAX is the longest blame path anyone reports. A path longer than this is
+// BLAME_PATH_MAX is the longest blame path the checker reports. A path longer than this is
 // truncated at the source end, which costs a diagnostic some of its hop count but never
 // changes a verdict.
 #define BLAME_PATH_MAX 64
@@ -63,7 +63,7 @@ typedef struct {
 
         // MALFORMED_OUT_OF_MEMORY is the grounding judgement's scratch array could not be
         // allocated. It refuses rather than continuing, because a grounding check that
-        // silently does not run would accept every demand it exists to refuse.
+        // silently does not run would accept every demand it should refuse.
         MALFORMED_OUT_OF_MEMORY
     } malformed_reason;
 
@@ -86,10 +86,10 @@ typedef struct {
     // `carried_depth` below rather than by the height of the chain.
     int passes;
 
-    // carried_depth is the greatest number of carried edges on any one path, which is the
-    // recurrence nesting depth and the quantity `passes` is a function of: a lane climbs
-    // at most twice, but news of a climb crosses exactly one carried edge per sweep, so
-    // depth d settles in d + 2 passes.
+    // carried_depth is the most carried edges a change must cross to reach any node it
+    // reaches, counting the fewest along any path, and the quantity `passes` is a function
+    // of: a change crosses exactly one carried edge per sweep, nested or chained, so a
+    // graph at depth d settles in d + 2 passes.
     int carried_depth;
 } check_result_t;
 
@@ -139,8 +139,8 @@ static inline int check_malformed(const check_result_t *outcome) {
 // Takes d (diagnostic_t) which is where diagnostics are collected.
 check_result_t lattice_check(dag_t *g, int result, lane_t *computed, diagnostic_t *d);
 
-// lattice_compute_lanes runs the join sweep and nothing else, filling `computed` without
-// checking a single declaration or reporting anything.
+// lattice_compute_lanes runs the join sweep alone, filling `computed` without checking
+// any declaration or reporting anything.
 //
 // It is the checker's own sweep called without the check, because a build with the check
 // disabled still has to pick kernels, and a private second sweep that joined operands in

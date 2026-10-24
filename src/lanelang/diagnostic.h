@@ -36,8 +36,8 @@ typedef struct {
     int length;
 } span_t;
 
-// SPAN_NONE is the span used where there is no position to report. A line of 0 is what
-// marks it absent, and every reader tests that field rather than comparing whole spans.
+// SPAN_NONE is the span used where there is no position to report. A line of 0 marks it
+// absent, and every reader tests that field rather than comparing whole spans.
 static const span_t SPAN_NONE = {0, 0, 0, 0};
 
 // diagnostic_t is a sink holding the diagnostics reported against one source text.
@@ -98,11 +98,12 @@ int diagnostic_error_count(const diagnostic_t *sink);
 // diagnostic_mark records how much the sink holds, and diagnostic_rewind discards
 // everything recorded since a mark. A NULL sink marks at 0 and rewinds to nothing.
 //
-// The pair exists only for speculative reads. The parser tells a qualifier from a name by
-// one token of lookahead with a save-and-restore of its own cursor, and restoring the
-// cursor alone puts the tokens back but not the diagnostics: a lexer error inside the
-// lookahead is recorded once there and once again when the caller re-reads the same
-// character, so a program with one bad byte reports it twice. The cursor and the sink
+// The pair exists only for speculative reads. In a build that leaves the lane qualifiers
+// unreserved, the parser tells a qualifier from a name by one token of lookahead with a
+// save-and-restore of its own cursor, and restoring the cursor alone puts the tokens back
+// but not the diagnostics: a lexer error inside the lookahead is recorded once there and
+// once again when the caller re-reads the same character, so a program with one bad byte
+// reports it twice. The cursor and the sink
 // rewind together or neither does. Rewinding past a mark taken before an error the caller
 // means to keep would discard it, so a mark is taken and used in one place, immediately
 // around the speculative read.
@@ -145,7 +146,7 @@ int diagnostic_first_spans(const diagnostic_t *sink, span_t *primary, span_t *se
 // It exists so a fixture can assert what a refusal says and not only that one happened.
 // The match is a plain substring over the expanded message, so a fixture quotes the
 // clause it cares about, and rewording the rest of a message does not fail a fixture that
-// was never about the rest.
+// does not quote it.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 // Takes needle (char) which is the text to look for.

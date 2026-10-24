@@ -20,9 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-// MAX_NUMBER_DIGITS is bytes of a numeric literal that are handed to strtod, including
-// the terminator. A longer literal is a lexing error: truncating it could silently drop
-// an exponent and change the value.
+// MAX_NUMBER_DIGITS is how many bytes of a numeric literal are handed to strtod,
+// including the terminator. A longer literal is a lexing error: truncating it could
+// silently drop an exponent and change the value.
 #define MAX_NUMBER_DIGITS 64
 
 // PUNCTUATION is the punctuation that is one character long, paired with the token kind
@@ -51,8 +51,8 @@ static const struct {
 
 // KIND_NAMES pairs each token kind with how a diagnostic should name it: an English
 // phrase for the kinds that have no spelling, and the quoted spelling itself for the
-// rest. A kind absent here renders as "invalid token", which is what the caller wants for
-// TK_ERROR.
+// rest. A kind absent here renders as "invalid token", and TK_ERROR is left out so that
+// it renders that way.
 static const struct {
     // kind is the token kind being named.
     token_kind_t kind;
@@ -215,8 +215,8 @@ static int lexer_word_is(const char *start, const size_t length, const char *wor
 // kind and leaving every other keyword for the parser to match itself.
 //
 // The qualifiers are the only reserved words, because they are the only ones a program
-// can bind such that a demand disappears with no diagnostic; every other keyword fails
-// loudly when misused.
+// can bind such that a demand disappears with no diagnostic; every other keyword draws a
+// diagnostic when misused.
 //
 // Takes lexer (lexer_t) which is the token cursor.
 // Takes start (char) which is where the run begins.
@@ -266,7 +266,7 @@ static void lexer_scan_hex_digits(lexer_t *lexer) {
 }
 
 // lexer_scan_exponent scans an `e` or `E` exponent suffix if one is present. A suffix
-// with no digits after it is not an exponent at all but the start of whatever follows the
+// with no digits after it is not an exponent but the start of whatever follows the
 // number, so the cursor is put back.
 //
 // Takes lexer (lexer_t) which is the token cursor.
@@ -296,10 +296,9 @@ static void lexer_scan_exponent(lexer_t *lexer) {
 //
 // No end pointer is passed to strtod, because the lexer has already established that
 // every byte of `digits` is part of a number literal, so there is no unparseable input
-// for it to answer 0 for. The range failure is read, which is the whole reason this takes
-// an out parameter: strtod reports overflow through errno and still returns a value, so
-// discarding it turns `1e999` into a silent positive infinity and `1e-999` into a silent
-// zero.
+// for it to answer 0 for. The out parameter carries the range failure: strtod reports
+// overflow through errno and still returns a value, so discarding it turns `1e999` into a
+// silent positive infinity and `1e-999` into a silent zero.
 //
 // Takes token (token_t) which is the token under the cursor.
 // Takes out_of_range (int) which receives 1 when the literal does not fit a binary64.
@@ -320,13 +319,13 @@ static double lexer_number_value(const token_t *token, int *out_of_range) {
 // literal too long for the value buffer is reported and returned as TK_ERROR.
 //
 // The `0x` prefix is recognised because without it `0x1234abcd` scans as the number `0`
-// followed by the identifier `x1234abcd`: two tokens and no diagnostic, in the one place
-// a checksum is written. A `0x` with no digit after it is an error rather than a zero.
-// strtod parses what is scanned here without further help, since C99 gives it hexadecimal
-// floating constants, and a 32-bit checksum is exact in a binary64 well below 2^53. The
-// `p` exponent is not scanned, because a checksum is an integer and `0x1p3` would mean 8;
-// written anyway, it scans as `0x1` and the identifier `p3`, which the parser refuses
-// where it expects a closing parenthesis.
+// followed by the identifier `x1234abcd`: two tokens and no diagnostic, at the position
+// where a checksum is written. A `0x` with no digit after it is an error rather than a
+// zero. strtod parses what is scanned here without further help, since C99 gives it
+// hexadecimal floating constants, and a 32-bit checksum is exact in a binary64 well below
+// 2^53. The `p` exponent is not scanned, because a checksum is an integer and `0x1p3`
+// would mean 8; written anyway, it scans as `0x1` and the identifier `p3`, which the
+// parser refuses where it expects a closing parenthesis.
 //
 // Takes lexer (lexer_t) which is the token cursor.
 // Takes start (char) which is where the run begins.
@@ -387,8 +386,7 @@ static token_kind_t lexer_punctuation_kind(const char character) {
 }
 
 // lexer_scan_punctuation scans one punctuation token, reporting an unrecognised character
-// through the lexer's sink and returning TK_ERROR for it so the parser stops rather than
-// guessing.
+// through the lexer's sink and returning TK_ERROR for it so the parser stops.
 //
 // Takes lexer (lexer_t) which is the token cursor.
 // Takes start (char) which is where the run begins.

@@ -50,8 +50,8 @@ void eval_last_footprint(size_t *columns, size_t *tiles) {
 }
 
 // eval_apply_binary_operator applies one elementwise operator. An operator that is not
-// '+', '-', '*' or '/' is treated as addition, which is what a graph built by the
-// resolver never contains.
+// '+', '-', '*' or '/' is treated as addition; a graph built by the resolver never
+// contains one.
 //
 // Takes binary_operator (int) which is the operator character.
 // Takes left (double) which is the first operand.
@@ -205,8 +205,8 @@ static int eval_materialise_leaf(eval_state_t *state, const int index, const dag
 // Elements are read through eval_element_of, never from `columns[input]` directly,
 // because under a fused or tiled traversal an elementwise producer has no materialised
 // column and reading one would be a null dereference. A scan's serial reference is one
-// running total left to right, which is what scan_free computes at one worker, so the
-// reference path calls it with workers=1 rather than adding a fourth kernel.
+// running total left to right, the same as scan_free at one worker, so the reference path
+// calls scan_free with workers=1 rather than adding a fourth kernel.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -243,9 +243,8 @@ static int eval_materialise_scan(
 //
 // Bit patterns rather than values, because the bless is a claim about the bytes that
 // entered the computation: a signed zero and a NaN payload are values a comparison would
-// call equal and a rerun would not reproduce. It is a checksum rather than a hash; it
-// detects a file that changed, not an adversary who changed it, and nothing here resists
-// a chosen collision.
+// call equal and a rerun would not reproduce. It is a checksum: it detects a file that
+// changed, not an adversary who changed it, and nothing here resists a chosen collision.
 //
 // Takes data (double) which is the column to fingerprint.
 // Takes count (size_t) which is how many elements it holds.
@@ -261,13 +260,13 @@ unsigned eval_bless_checksum(const double *data, const size_t count) {
 // bless_checksum_holds verifies a blessed source against the column just loaded,
 // returning 0 when a declared checksum does not match it.
 //
-// The check runs before any arithmetic and fails closed, because a run that carried on
-// would produce numbers a downstream reader believes are reproducible with nothing
-// anywhere saying otherwise. The diagnostic says which claim broke: the lane still holds
-// and the fold order is unchanged, while what is false is the developer's premise that
-// the bytes would be the same next run. `count` is the clamped count, which is the column
-// that actually exists; a checksum taken over what was asked for rather than over what
-// was loaded would never match.
+// The check runs before any arithmetic over the column and fails closed, because a run
+// that carried on would produce numbers a downstream reader believes are reproducible,
+// with nothing saying otherwise. The diagnostic says which claim broke: the lane still
+// holds and the fold order is unchanged, while what is false is the developer's premise
+// that the bytes would be the same next run. `count` is the clamped count, which is the
+// column that exists; a checksum taken over what was asked for rather than over what was
+// loaded would never match.
 //
 // Takes node (dagnode_t) which is the source node under examination.
 // Takes data (double) which is the column just loaded.
@@ -473,7 +472,7 @@ static int eval_materialise_choose(
 // eval_materialise_recur materialises a recurrence's current value.
 //
 // On the first pass this is the seed; each later pass overwrites it with the body's value
-// before the nodes between them are run again, so this only ever establishes the starting
+// before the nodes between them are run again, so this establishes only the starting
 // point.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
@@ -780,7 +779,7 @@ static void eval_state_free(eval_state_t *state, const int count) {
 //
 // The answer is read through eval_element_of rather than off the result's column, because
 // a node that materialises only under EVAL_MATERIALISE has no column under the other two
-// traversals, and the one-input wrappers OP_OPAQUE and OP_DEMAND are exactly that shape;
+// traversals, and the one-input wrappers OP_OPAQUE and OP_DEMAND have that shape;
 // requiring a column here would make a program whose result is a wrapper fail to evaluate
 // under fusion and tiling.
 //
@@ -840,8 +839,8 @@ int eval_dag(const dag_t *g, const int result, const eval_mode_t mode, const siz
 // eval_dag_on_reference evaluates `g` with every combining kernel replaced by the serial
 // order, and writes the result scalar to `out`.
 //
-// Materialised, one worker, no tiling: the reference is not a schedule, so it is
-// evaluated at the one point of the schedule space where nothing has been chosen.
+// Materialised, one worker, no tiling: the reference is not a deployment schedule, so it
+// is evaluated at the point of the schedule space where nothing has been chosen.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.

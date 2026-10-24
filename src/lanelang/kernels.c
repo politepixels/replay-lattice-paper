@@ -141,8 +141,8 @@ int fold_replay(eval_state_t *state, const int input, const size_t length, doubl
 // fold_free is the free fold: chunk by worker count rather than by a fixed width, and
 // combine the partials in worker order.
 //
-// That is the shape a reduction takes when nobody pinned it, and it is why its bits move
-// when the deployment does. It falls back to fold_strict if the partials cannot be got.
+// That is the shape a reduction takes when nobody pinned it, so its bits move when the
+// deployment does. It falls back to fold_strict if the partials cannot be got.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node whose column is read.
@@ -189,10 +189,10 @@ double fold_free(eval_state_t *state, const int input, const size_t length,
 #define EVAL_SCAN_BLOCK 64
 
 #ifdef LANELANG_SCAN_BLOCK_FOLLOWS_WORKERS
-// CC10_ELEMENTS_PER_WORKER is the perturbed width's scaling, small enough that the test
+// SCAN_WIDTH_ELEMENTS_PER_WORKER is the perturbed width's scaling, small enough that the test
 // programs straddle several blocks; any value that makes the width follow the worker
 // count breaks the claim equally.
-#define CC10_ELEMENTS_PER_WORKER 8u
+#define SCAN_WIDTH_ELEMENTS_PER_WORKER 8u
 
 // scan_leaf_width lets the deployment pick the width: the kernel still looks blocked and
 // still writes disjoint output ranges, only the width moves, and that is enough to move
@@ -200,10 +200,10 @@ double fold_free(eval_state_t *state, const int input, const size_t length,
 //
 // Takes workers (int) which is how many workers the schedule uses.
 static size_t scan_leaf_width(const int workers) {
-    return workers > 0 ? (size_t) workers * CC10_ELEMENTS_PER_WORKER : EVAL_SCAN_BLOCK;
+    return workers > 0 ? (size_t) workers * SCAN_WIDTH_ELEMENTS_PER_WORKER : EVAL_SCAN_BLOCK;
 }
 #else
-// scan_leaf_width is the frozen width, which is what ships.
+// scan_leaf_width is the frozen width the shipped build uses.
 //
 // Takes workers (int) which is how many workers the schedule uses.
 static size_t scan_leaf_width(const int workers) {
@@ -276,15 +276,14 @@ void scan_free(eval_state_t *state, const int input, double *out, const size_t l
 }
 
 // EVAL_EXACT_INTEGER_LIMIT is the largest magnitude at which every integer is exactly
-// representable in a double. At or below it, integer addition is `exact` and associative,
-// which is the entire reason an exact-integer fold may be scheduled freely and still earn
-// an `exact` demand.
+// representable in a double. An exact-integer fold may be scheduled freely and still earn
+// an `exact` demand because, at or below it, integer addition is `exact` and associative.
 #define EVAL_EXACT_INTEGER_LIMIT 9007199254740992.0
 
 // eval_is_exact_integer reports whether `x` is an integer this fold may accept: finite,
 // integral, and within the range where addition cannot round.
 //
-// Takes x (double) which is the value to convert.
+// Takes x (double) which is the value tested.
 static int eval_is_exact_integer(const double x) {
     return !(x > -EVAL_EXACT_INTEGER_LIMIT && x < EVAL_EXACT_INTEGER_LIMIT)
            ? 0
@@ -394,13 +393,13 @@ int fold_integer(eval_state_t *state, const int input, const size_t length,
 #define CONTROL_EXACT_LOWERS_TO_TREE 0
 #endif
 
-// fold_exact discharges an `exact` demand, which is the serial fold and nothing else.
+// fold_exact discharges an `exact` demand with the serial fold.
 //
-// The control build discharges it with the fixed tree instead. The fixed tree is a
-// perfectly good `replay` kernel and is schedule-invariant, and it is not the serial
-// reference for floating point, so that build is one in which a single lane has two bit
-// patterns depending on which kernel discharged it; every schedule-axis assertion still
-// passes under it, and only the reference comparison notices.
+// The control build discharges it with the fixed tree instead. The fixed tree is a valid
+// `replay` kernel and is schedule-invariant, but it is not the serial reference for
+// floating point, so that build is one in which a single lane has two bit patterns
+// depending on which kernel discharged it; every schedule-axis assertion still passes
+// under it, and only the reference comparison notices.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node holding the column being folded.

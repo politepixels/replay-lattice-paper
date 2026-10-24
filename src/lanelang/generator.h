@@ -20,12 +20,12 @@
 
 // generator_fill writes values[0..count) deterministically.
 //
-// A seed of zero is folded to a usable value rather than degenerating. The bit patterns
-// are identical on any IEEE-754 binary64 host.
+// A seed that mixes to a zero state is replaced by a fixed one, because a xorshift stream
+// cannot leave zero. The bit patterns are identical on any IEEE-754 binary64 host.
 //
 // Takes seed (uint64_t) which seeds the generator.
-// Takes values (double) which is the column being folded.
-// Takes count (size_t) which is how many nodes the graph holds.
+// Takes values (double) which receives the column.
+// Takes count (size_t) which is how many values to write.
 void generator_fill(uint64_t seed, double *values, size_t count);
 
 #endif  // RL_GENERATOR_H

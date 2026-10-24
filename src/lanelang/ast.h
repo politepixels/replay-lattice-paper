@@ -19,8 +19,8 @@
 #include "lane.h"
 
 // MAX_CALL_ARGUMENTS is how many arguments one call may have, and how many argument nodes
-// lowering will hold for it. The parser refuses a longer call before lowering ever sees
-// it, and lowering sizes a stack array to exactly this and relies on that refusal.
+// lowering will hold for it. The parser refuses a longer call before lowering sees it,
+// and lowering sizes a stack array to this bound and relies on that refusal.
 #define MAX_CALL_ARGUMENTS 8
 
 // expr_kind_t is what an expression node is.
@@ -39,7 +39,7 @@ typedef enum {
 
     // EX_LAMBDA is a step function written inline, `(acc, t) => e`, whose payload is in
     // `lambda`. It is not a value: the parser admits it only as the value of a `with:`
-    // label, which is what stops one being bound, returned or put in a column.
+    // label, so one cannot be bound, returned or put in a column.
     EX_LAMBDA
 } expr_kind_t;
 
@@ -117,7 +117,7 @@ typedef struct {
     expr_t *value;
 
     // lane is the demand written as a qualifier before the name, or LANE_NONE. The
-    // qualifier covers the whole right-hand side, so there is exactly one reading of it.
+    // qualifier covers the whole right-hand side, so it has a single reading.
     lane_t lane;
 
     // lane_span is the qualifier's source text, for blame.
@@ -243,8 +243,8 @@ typedef struct {
     expr_t *result;
 } func_t;
 
-// program_t is a whole parsed source file. Every node it points at lives in its arena, so
-// the program is freed in one call and nothing inside it is freed individually.
+// program_t is a parsed source file. Every node it points at lives in its arena, so the
+// program is freed in one call and nothing inside it is freed individually.
 typedef struct {
     // functions is the declared functions, in the order they were written.
     func_t *functions;

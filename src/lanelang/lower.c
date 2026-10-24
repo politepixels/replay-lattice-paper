@@ -26,9 +26,9 @@
 // node that is neither.
 //
 // The discharge is chosen by the operation, never by the demand: this function reads
-// `op_class` and nothing else, not `declared`, not the lane the sweep computed, not the
-// ambient. That is what makes a lane a function of the bits rather than the other way
-// round, and it is the invariant lower_kernel_demand_free_cases asserts.
+// `op_class`, and not `declared`, the lane the sweep computed, or the ambient. This makes
+// a lane a function of the bits rather than the other way round, and it is the invariant
+// lower_kernel_demand_free_cases asserts.
 //
 // Takes node (dagnode_t) which is the node under examination.
 const char *lower_kernel_for(const dagnode_t *node) {
@@ -87,10 +87,9 @@ static int kernel_is_demand_free(dagnode_t *probe, const lane_t *lanes, const si
 // It holds `op_class` fixed, sweeps `declared` and `lane` over every value the chain
 // admits, and requires the selected kernel to be byte-identical throughout, so a build
 // that lets either field reach the selection returns 0. The failure it catches is
-// invisible to a verdict, because a demand-driven discharge accepts exactly the same
-// programs and emits different bits. The op has to match the class, or a scan class would
-// be asked through the fold arm and the sweep would compare a kernel neither family
-// emits.
+// invisible to a verdict, because a demand-driven discharge accepts the same programs and
+// emits different bits. The op has to match the class, or a scan class would be asked
+// through the fold arm and the sweep would compare a kernel neither family emits.
 int lower_kernel_demand_free_cases(void) {
     static const opclass_t classes[] = {
         OPC_NEUTRAL, OPC_FOLD_EXACT, OPC_FOLD_INTEGER, OPC_FOLD_REPLAY, OPC_FOLD_APPROX,

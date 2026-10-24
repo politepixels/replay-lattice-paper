@@ -15,19 +15,44 @@
 #include "dag.h"
 #include "eval.h"
 #include "generator.h"
+#include "heal.h"
+#include "parse.h"
+#include "resolve.h"
 #include "status.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define COLUMN 256
 
 #define WORLD_BLESSED 1u
 #define WORLD_OTHER   2u
 
+#define SOURCE_BYTES 256
+
+static const char PROGRAM[] =
+    "package app\n"
+    "\n"
+    "func main() Float {\n"
+    "    %s x := source(count: 256.0)\n"
+    "    replay energy := sum(x)\n"
+    "    return energy\n"
+    "}\n";
+
 static long cases = 0;
 
 static long failures = 0;
+
+typedef struct {
+    char source[SOURCE_BYTES];
+
+    diagnostic_t *diagnostics;
+
+    program_t *program;
+
+    resolved_t resolved;
+} built_program_t;
 
 static void check(const int ok, const char *what) {
     cases++;
@@ -37,32 +62,46 @@ static void check(const int ok, const char *what) {
     }
 }
 
-static dag_t *build_source_fold(int *source_out) {
-    dag_t *g = dag_new();
-    if (!g) {
-        return NULL;
-    }
-    dagnode_t source;
-    dag_node_init(&source);
-    source.op = OP_SOURCE;
-    source.op_class = OPC_NEUTRAL;
-    source.constant = (double) COLUMN;
-    const int source_index = dag_append(g, &source);
+static void free_program(built_program_t *built) {
+    dag_free(built->resolved.dag);
+    built->resolved.dag = NULL;
+    ast_free(built->program);
+    built->program = NULL;
+    diagnostic_free(built->diagnostics);
+    built->diagnostics = NULL;
+}
 
-    dagnode_t fold;
-    dag_node_init(&fold);
-    fold.op = OP_FOLD;
-    fold.op_class = OPC_FOLD_REPLAY;
-    fold.in[0] = source_index;
-    fold.input_count = 1;
-    const int fold_index = dag_append(g, &fold);
+static int build_blessed(const char *blessing, built_program_t *built) {
+    memset(built, 0, sizeof *built);
+    snprintf(built->source, sizeof built->source, PROGRAM, blessing);
 
-    if (source_index < 0 || fold_index < 0) {
-        dag_free(g);
-        return NULL;
+    built->diagnostics = diagnostic_new("<bless>", built->source);
+    built->program = parse_program("<bless>", built->source, built->diagnostics);
+    if (!built->program) {
+        free_program(built);
+        return 0;
     }
-    *source_out = source_index;
-    return g;
+    built->resolved = resolve_program(built->program, "main", built->diagnostics);
+    if (built->resolved.status != RESOLVE_OK || !built->resolved.dag) {
+        free_program(built);
+        return 0;
+    }
+    (void) heal_program(built->resolved.dag, built->resolved.result);
+
+    const int count = dag_count(built->resolved.dag);
+    lane_t *computed = (lane_t *) calloc((size_t) (count > 0 ? count : 1), sizeof(lane_t));
+    if (!computed) {
+        free_program(built);
+        return 0;
+    }
+    const check_result_t outcome = lattice_check(built->resolved.dag, built->resolved.result,
+                                                 computed, built->diagnostics);
+    free(computed);
+    if (check_rejected(&outcome) || check_malformed(&outcome)) {
+        free_program(built);
+        return 0;
+    }
+    return 1;
 }
 
 static int checksum_of_world(const unsigned world, unsigned *out) {
@@ -76,40 +115,44 @@ static int checksum_of_world(const unsigned world, unsigned *out) {
     return 1;
 }
 
-static int evaluates(const dag_t *g, const int result, const unsigned world) {
+static int evaluates(const built_program_t *built, const unsigned world) {
     double value = 0.0;
-    return eval_dag_in_world(g, result, EVAL_MATERIALISE, 0, 1, world, &value);
+    return eval_dag_in_world(built->resolved.dag, built->resolved.result, EVAL_MATERIALISE, 0, 1,
+                             world, &value);
 }
 
 int main(void) {
     rl_build_stamp("test_bless");
 
-    int source_index = -1;
-    dag_t *g = build_source_fold(&source_index);
-    if (!g) {
-        return RL_FAIL("L5", 0, "bless-harness-out-of-memory");
-    }
-    const int result = dag_count(g) - 1;
-
     unsigned blessed = 0;
     unsigned other = 0;
     if (!checksum_of_world(WORLD_BLESSED, &blessed) || !checksum_of_world(WORLD_OTHER, &other)) {
-        dag_free(g);
         return RL_FAIL("L5", 0, "bless-harness-out-of-memory");
+    }
+
+    char checksum[32];
+    snprintf(checksum, sizeof checksum, "@bless(0x%08x)", blessed);
+    built_program_t promise;
+    built_program_t receipt;
+    if (!build_blessed("@bless", &promise)) {
+        return RL_FAIL("L5", 0, "bless-program-did-not-build");
+    }
+    if (!build_blessed(checksum, &receipt)) {
+        free_program(&promise);
+        return RL_FAIL("L5", 0, "bless-program-did-not-build");
     }
 
     check(blessed != other, "the two worlds hand back different data");
 
-    dag_at(g, source_index)->bless = BLESS_PROMISE;
-    check(evaluates(g, result, WORLD_BLESSED), "an unconditional bless evaluates in its own world");
-    check(evaluates(g, result, WORLD_OTHER), "an unconditional bless evaluates in another world");
+    check(evaluates(&promise, WORLD_BLESSED), "an unconditional bless evaluates in its own world");
+    check(evaluates(&promise, WORLD_OTHER), "an unconditional bless evaluates in another world");
 
-    dag_at(g, source_index)->bless = (long long) blessed + 1;
-    check(evaluates(g, result, WORLD_BLESSED), "a matching blessed checksum evaluates");
+    check(evaluates(&receipt, WORLD_BLESSED), "a matching blessed checksum evaluates");
 
-    check(!evaluates(g, result, WORLD_OTHER), "a blessed checksum refuses another world's data");
+    check(!evaluates(&receipt, WORLD_OTHER), "a blessed checksum refuses another world's data");
 
-    dag_free(g);
+    free_program(&promise);
+    free_program(&receipt);
     printf("\n%ld assertions, %ld failed\n", cases, failures);
     return failures
            ? RL_FAIL("L5", cases, "blessed-checksum-not-enforced")

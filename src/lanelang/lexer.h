@@ -32,9 +32,9 @@ typedef enum {
     // may prefix a value's name and state a fact about it. They are reserved and nothing
     // else is, because left as identifiers they can be bound, and a demand then vanishes
     // with no diagnostic: `replay := sum(x)` binds a variable called `replay`, states
-    // nothing, and selects the free kernel. A program naming one of these words stops
-    // compiling. `lexer_token_is` matches this kind as well as TK_IDENT, so a parser
-    // asking whether a token spells a word need not know which kind carries it.
+    // nothing, and selects the free kernel. A program that uses one of these words as a
+    // name does not compile. `lexer_token_is` matches this kind as well as TK_IDENT, so a
+    // parser asking whether a token spells a word need not know which kind carries it.
     TK_QUALIFIER,
 
     // TK_NUMBER is a numeric literal, whose value is in the token's `number` field.
@@ -101,7 +101,7 @@ typedef struct {
     span_t span;
 
     // text is the start of the token's text inside the source buffer. It is not
-    // terminated, so it is only ever read together with `length`.
+    // terminated, so it must be read together with `length`.
     const char *text;
 
     // length is how many bytes of `text` belong to this token.

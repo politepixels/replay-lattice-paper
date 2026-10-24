@@ -69,8 +69,8 @@ typedef struct {
     chunk_t *head;
 } arena_t;
 
-// parser_t is the parser's whole state, small enough to copy for the one place that needs
-// to look ahead by two tokens.
+// parser_t is the parser's whole state, small enough to copy wherever the parser needs to
+// look ahead by two tokens.
 typedef struct {
     // lexer is the token source.
     lexer_t lexer;
@@ -104,8 +104,9 @@ void *arena_alloc(arena_t *arena, const size_t size);
 // parse_copy_to_arena copies `count` items into the arena and returns the copy.
 //
 // A count of zero returns NULL without reading `items`, so a caller with an empty list
-// gets NULL for two different reasons and must test the count, not the pointer. Every
-// caller here does, in the shape `count > 0 && !copy`.
+// gets NULL for two different reasons and must test the count, not the pointer. The
+// callers test `count > 0 && !copy`, except parse_finish, whose count is never zero
+// because parse_program refuses an empty program first.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes items (void) which is the array being copied.
@@ -183,8 +184,8 @@ typedef struct {
 // parse_bindings reads the `name := expr` bindings at the head of a body into `bindings`,
 // which holds MAX_BINDINGS entries, stopping at `return`.
 //
-// It is shared by a function's body and a step function's braced body, which is what
-// makes a binding mean the same in both.
+// It is shared by a function's body and a step function's braced body, so a binding means
+// the same in both.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes bindings (bind_t) which holds the bindings in scope.

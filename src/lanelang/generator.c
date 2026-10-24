@@ -31,8 +31,8 @@
 #define MANTISSA_DISCARD_BITS 11
 
 // EXPONENT_SPAN is how many exponents the draw is scaled across. Forty binades of dynamic
-// range is what makes the summation ill-conditioned enough for the bracketing to reach
-// the low bits.
+// range make the summation ill-conditioned enough for the bracketing to reach the low
+// bits.
 #define EXPONENT_SPAN 41
 
 // EXPONENT_OFFSET centres the drawn exponent on zero, giving [-20, 20].
@@ -40,7 +40,7 @@
 
 // CANCEL_RESIDUE_SHIFT is how far below a cancellation pair's magnitude its residue sits.
 // Small enough that the true sum is dominated by the residues rather than by the
-// summands, which is what makes the low bits of the result an artefact of the bracketing.
+// summands. The low bits of the result are then an artefact of the bracketing.
 #define CANCEL_RESIDUE_SHIFT 30
 
 // CANCEL_TAIL_EXPONENT is the exponent of the uncancelled tail element written when the
@@ -60,8 +60,7 @@
 // XORSHIFT_SHIFT_C is the third shift of the xorshift64* triple.
 #define XORSHIFT_SHIFT_C 27
 
-// XORSHIFT_MULTIPLIER is xorshift64*'s output multiplier, which is what makes it a `*`
-// variant.
+// XORSHIFT_MULTIPLIER is the output multiplier that makes xorshift64* a `*` variant.
 #define XORSHIFT_MULTIPLIER 0x2545F4914F6CDD1DULL
 
 // SEED_MIX is xor-folded into the caller's seed to pick the stream. The value is frozen
@@ -77,7 +76,7 @@
 // xorshift_next advances a xorshift64* stream and returns the next word. The state must
 // not be zero.
 //
-// Takes state (uint64_t) which is the evaluation in progress.
+// Takes state (uint64_t) which is the xorshift state, advanced in place.
 static uint64_t xorshift_next(uint64_t *state) {
     uint64_t word = *state;
     word ^= word >> XORSHIFT_SHIFT_A;
@@ -89,7 +88,7 @@ static uint64_t xorshift_next(uint64_t *state) {
 
 // mixed_mantissa draws a mantissa in [-1, 1) from 53 random bits.
 //
-// Takes state (uint64_t) which is the evaluation in progress.
+// Takes state (uint64_t) which is the xorshift state, advanced in place.
 static double mixed_mantissa(uint64_t *state) {
     const int64_t centred =
         (int64_t) (xorshift_next(state) >> MANTISSA_DISCARD_BITS) - TWO_TO_THE_52_INT;
@@ -98,7 +97,7 @@ static double mixed_mantissa(uint64_t *state) {
 
 // mixed_exponent draws an exponent in [-20, 20].
 //
-// Takes state (uint64_t) which is the evaluation in progress.
+// Takes state (uint64_t) which is the xorshift state, advanced in place.
 static int mixed_exponent(uint64_t *state) {
     return (int) (xorshift_next(state) % EXPONENT_SPAN) - EXPONENT_OFFSET;
 }
@@ -109,8 +108,8 @@ static int mixed_exponent(uint64_t *state) {
 // element uncancelled.
 //
 // Takes seed (uint64_t) which seeds the generator.
-// Takes values (double) which is the column being folded.
-// Takes count (size_t) which is how many nodes the graph holds.
+// Takes values (double) which receives the column.
+// Takes count (size_t) which is how many values to write.
 void generator_fill(const uint64_t seed, double *values, const size_t count) {
     const uint64_t mixed = seed ^ SEED_MIX;
     uint64_t state = mixed ? mixed : XORSHIFT_FALLBACK_STATE;

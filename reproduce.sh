@@ -25,8 +25,8 @@ cd "$(dirname "$0")" || exit 1
 # shellcheck source=scripts/lib/receipts.sh
 . ./scripts/lib/receipts.sh
 
-# Buffer the run table and print it in id order at the end: legs run in dependency order (the
-# self-check first, builds before checkers), which is not the order a reader scans.
+# Buffer the run table and print it in id order at the end: the legs every other leg depends on
+# run first (the self-check, the clean build and the build stamps), then the rest in id order.
 RL_SORT_ROWS=1
 
 # The scratch directory holding every leg's captured output, removed on a trap.
@@ -102,14 +102,14 @@ parse_arguments() {
     done
 }
 
-# The leg registry: one row per leg, as id, skip tag and description. --list, --help, the skip-tag
-# mapping and the final tally all read it, and it is the one representation of the leg set.
+# The leg registry: one row per leg, as id, skip tag and description. --list, the skip-tag mapping
+# and the final tally all read it, and this script keeps no other list of the legs.
 LEGS=(
   "L1|cccl|the CCCL composition counterexample"
   "L2|coq|section 3.5's operation-class rows, proved of one concrete evaluator"
   "L3|lanelang|the checker's fixtures, with blame spans and kernel picks"
   "L4|lanelang|what the lane forbids the compiler: traversal cannot move a pinned value; CC14 stages the split"
-  "L5|-|a blessed checksum refuses another world's data, and an unblessed source does not"
+  "L5|-|a blessed checksum refuses another world's data, and the unconditional form does not"
   "L6|lanelang|the same oracle over programs the front end actually parsed"
   "L7|lanelang|the differential oracle: linear join vs exhaustive path enumeration"
   "L8|lanelang|metamorphic properties of the checker"
@@ -325,7 +325,7 @@ control_roster_drift() {
     registry="$(printf '%s\n' "$block" | sed -n 's/^ *"\([A-Z]\{1,2\}[0-9][^"]*\)".*$/\1/p')"
     parsed="$(printf '%s\n' "$registry" | grep -c .)"
     quoted="$(printf '%s\n' "$block" | grep -c '^ *"')"
-    out="$(rl_floor_shortfall 'controls.sh registry rows' "$parsed" 18)"
+    out="$(rl_floor_shortfall 'controls.sh registry rows' "$parsed" 19)"
     [ "$quoted" -eq "$parsed" ] \
         || out="$out
   the registry holds $quoted quoted row(s) and the id pattern read $parsed: some id has a shape the parser cannot see"
@@ -725,20 +725,20 @@ run_build_legs() {
     run_build_stamp_leg
 }
 
-# run_oracle_legs runs legs L7, L8 and L6: the differential oracle, the metamorphic properties,
-# and the same oracle over programs the front end actually parsed.
+# run_oracle_legs runs legs L6, L7 and L8: the oracle over programs the front end parsed, the
+# differential oracle, and the metamorphic properties.
 # Globals:
 #   BIN - Read
 #   rows and the tallies - Updated through the legs
 run_oracle_legs() {
     if [ -x "$BIN/lanefuzz" ]; then
+        run_leg L6 "$BIN/lanefuzz" --roundtrip
         run_leg L7 "$BIN/lanefuzz" --agree
         run_leg L8 "$BIN/lanefuzz" --metamorphic
-        run_leg L6 "$BIN/lanefuzz" --roundtrip
     else
+        leg_row L6 SKIP 0 not-built
         leg_row L7 SKIP 0 not-built
         leg_row L8 SKIP 0 not-built
-        leg_row L6 SKIP 0 not-built
     fi
 }
 
@@ -750,8 +750,8 @@ run_schedule_leg() {
     run_leg L4 "$BIN/test_schedule"
 }
 
-# run_checker_legs runs the legs that gate the checker: its fixtures, the annotation burden, the
-# schedule invariance, and the oracle family.
+# run_checker_legs runs legs L2 to L9 in id order: the operation-class proofs, the fixtures, the
+# schedule invariance, the blessing receipt, the oracle family and the mechanised metatheory.
 # Globals:
 #   WORK, BIN, lanelang_make - Read
 #   rows and the tallies - Updated through the legs
@@ -759,17 +759,17 @@ run_schedule_leg() {
 #   One run-table row per leg, and the last ten lines of the build log when the checker failed to
 #   build
 run_checker_legs() {
+    run_leg L2 ./scripts/check-proofs-eval.sh
     if "${lanelang_make[@]}" all >"$WORK/ll.log" 2>&1; then
         run_leg L3 "$BIN/test_lanelang" src/tests/lanelang
-        run_leg L5 "$BIN/test_bless"
         run_schedule_leg
+        run_leg L5 "$BIN/test_bless"
     else
         leg_row L3 FAIL 0 lanelang-build-failed
         tail -10 "$WORK/ll.log" | sed 's/^/      /'
     fi
     run_oracle_legs
     run_leg L9 ./scripts/check-proofs.sh
-    run_leg L2 ./scripts/check-proofs-eval.sh
 }
 
 # run_cccl_leg runs leg L1: the CCCL composition counterexample, where it is built.
@@ -846,8 +846,8 @@ verdict_ledger_counts() {
     return 1
 }
 
-# verdict_declared_skips asserts that every skip was declared, which is the mechanism that stops a
-# silently degraded suite reporting a clean run.
+# verdict_declared_skips asserts that every skip was declared, so that a suite that has silently
+# lost a leg cannot report a clean run.
 # Outputs:
 #   Up to five lines naming the skips and what could be done about them
 # Returns:
@@ -926,8 +926,8 @@ main() {
     echo "-----------------------------"
     build_make_commands
     run_build_legs
-    run_checker_legs
     run_experiment_legs
+    run_checker_legs
     print_verdict
 }
 

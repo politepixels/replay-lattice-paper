@@ -164,10 +164,10 @@ run_programs() {
 
 # check_floor asserts that every assertion ran.
 #
-# NOT COUNTED AS AN ASSERTION OF ITS OWN. It used to increment `cases` and then test the value it
-# had just moved, so the only path reaching the comparison had already satisfied it; the tally was
-# an assertion about itself. Six independently falsifiable assertions is the number, and this
-# function is the guard that they all ran rather than a seventh.
+# It is not an assertion of its own and must not increment `cases`: a check that incremented the
+# count and then tested it would be satisfied on every path that reached the comparison, an
+# assertion about itself. The leg makes six independently falsifiable assertions, and this
+# function guards that all six ran.
 # Globals:
 #   cases - Read
 #   fails - Incremented on violation

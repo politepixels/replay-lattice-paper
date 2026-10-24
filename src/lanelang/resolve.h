@@ -26,9 +26,9 @@ typedef enum {
     RESOLVE_OK = 0,
 
     // RESOLVE_MALFORMED is a structural defect, an undefined name, a self reference or a
-    // call to a function that does not exist, kept strictly separate from a lane verdict
-    // because "your program is not well formed" and "your program violates a determinism
-    // demand" are different answers.
+    // call to a function that does not exist, kept separate from a lane verdict because
+    // "your program is not well formed" and "your program violates a determinism demand"
+    // are different answers.
     RESOLVE_MALFORMED = 1
 } resolve_status_t;
 
@@ -53,20 +53,20 @@ typedef struct {
 // Takes diagnostics (diagnostic_t) which is where diagnostics are collected.
 resolved_t resolve_program(program_t *program, const char *entry, diagnostic_t *diagnostics);
 
-// resolve_verify_declarations lowers, heals and lane-checks every function the entry path
-// would not reach, so a published return lane and every demand written inside a body are
-// verified whether or not anything calls them.
+// resolve_verify_declarations lowers, heals and lane-checks every function other than the
+// entry on a lowering of its own, so a published return lane and every demand written inside
+// a body are verified whether or not anything calls them.
 //
 // Takes program (program_t) which is the parsed program.
 // Takes entry (char) which is the entry function's name, skipped because it is lowered
 // anyway.
 // Takes diagnostics (diagnostic_t) which is where a refusal is reported.
-// Takes rejected (int) which is set when a body violated a demand rather than failing to
-// resolve, so the caller reports a lane verdict rather than a structural one.
+// Takes malformed (int) which is set when a declaration failed to resolve or produced no
+// lanes, so the caller reports a structural answer rather than a lane verdict.
 // Takes found (check_result_t) which receives what was wrong, the two kinds of refusal
 // counted apart.
 // Returns 1 when each one checks, 0 when one did not.
 int resolve_verify_declarations(program_t *program, const char *entry, diagnostic_t *diagnostics,
-                                int *rejected, check_result_t *found);
+                                int *malformed, check_result_t *found);
 
 #endif  // LANELANG_RESOLVE_H

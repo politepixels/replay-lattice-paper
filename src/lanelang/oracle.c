@@ -38,8 +38,8 @@ typedef struct {
 //
 // Every complete path, meaning one that reaches a node with no inputs, contributes its
 // accumulated weakest class, and the answer is the weakest across all of them. The walk
-// memoises nothing and shares no state between paths, which is what keeps its agreement
-// with the sweep evidence rather than the same algorithm answering twice.
+// memoises nothing and shares no state between paths, so its agreement with the sweep
+// stays evidence rather than the same algorithm answering twice.
 //
 // Takes state (walk_t) which is the enumeration in progress.
 // Takes at (int) which is the node to start from.

@@ -190,8 +190,8 @@ int diagnostic_mark(const diagnostic_t *sink) {
 
 // diagnostic_rewind discards every entry recorded after `mark`.
 //
-// Recomputing the tally rather than decrementing it matters because an entry may be a
-// note and the two counts do not move together.
+// The tally is recomputed rather than decremented, because an entry may be a note and the
+// two counts do not move together.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 // Takes mark (int) which is a value diagnostic_mark returned earlier for this sink.
@@ -325,7 +325,7 @@ static void diagnostic_render_span(
 // diagnostic_primary_label chooses the label for an entry's primary underline. Only an
 // error's primary span is the demand site, and only when the entry has a second end; a
 // note points at whatever it is about, so labelling it "the demand is stated here" would
-// be a lie.
+// be false.
 //
 // Takes entry (entry_t) which is the entry whose label is chosen.
 static const char *diagnostic_primary_label(const entry_t *entry) {

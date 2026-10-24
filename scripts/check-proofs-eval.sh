@@ -80,7 +80,8 @@ compile_developments() {
 
 # write_assumptions_query writes the audit script: one Print Assumptions per row of the
 # operation-class table, plus the witnesses that the model can tell schedules apart at
-# all, listed deliberately because invariance rows with no way to fail assert nothing.
+# all and that the fixed tree is not the serial reference, listed deliberately because
+# invariance rows with no way to fail assert nothing.
 # Globals:
 #   WORK - Read
 write_assumptions_query() {
@@ -104,6 +105,7 @@ Print Assumptions witness_move_by_workers_moves.
 Print Assumptions witness_recurrence_by_workers_moves.
 Print Assumptions witness_source_by_workers_moves.
 Print Assumptions witness_elementwise_by_workers_moves.
+Print Assumptions witness_fixed_tree_is_not_reference.
 Print Assumptions demo_prog_wf.
 Print Assumptions demo_assumption1.
 Print Assumptions mgated_separates.
@@ -157,12 +159,12 @@ check_axiom_set() {
 #   WORK - Read
 #   cases - Incremented when the assertion holds
 # Outputs:
-#   The observed count on stderr when it is not exactly 19
+#   The observed count on stderr when it is not exactly 20
 check_axiom_free_count() {
     local closed_count
     closed_count="$(grep -c '^Closed under the global context' "$WORK/assumptions.log")"
-    if [ "$closed_count" -ne 19 ]; then
-        printf '    expected exactly 19 axiom-free results, saw %s\n' "$closed_count" >&2
+    if [ "$closed_count" -ne 20 ]; then
+        printf '    expected exactly 20 axiom-free results, saw %s\n' "$closed_count" >&2
         say FAIL "$cases" 0 rows-not-axiom-free
     fi
     cases=$((cases + 1))

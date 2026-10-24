@@ -11,17 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package app
 
-// EXPECT: accept
-// EXPECT-KERNEL: fold_strict
-// EXPECT-NO-KERNEL: fold_replay
-func needs_exact(exact v Float) Float {
+func loosen(approx v Float) Float {
     return v
 }
 
+// EXPECT: accept
+// EXPECT-NO-KERNEL: fold_free
 func main() Float {
-    x := indices(count: 100000.0)
-    replay s := sum(x * 3.0)
-    return needs_exact(s)
+    x := indices(count: 1000.0)
+    s := sum(x * 3.0)
+    replay r := loosen(s)
+    return r
 }

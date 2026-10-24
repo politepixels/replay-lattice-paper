@@ -192,9 +192,9 @@ static int iterate_is_well_formed(resolve_state_t *state, const expr_t *call,
 // this tick, returning its index or -1 after reporting a defect.
 //
 // The seed is lowered while the carried name is not in scope, because a seed is computed
-// once before the clock starts and may not read the value it seeds. That rule then falls
-// out of ordinary scoping rather than needing a check of its own, which is why this runs
-// before the caller binds the name.
+// once before the clock starts and may not read the value it seeds. That rule then
+// follows from ordinary scoping and needs no check of its own, so this runs before the
+// caller binds the name.
 //
 // The carried edge is left unset here and filled in by the caller once the step's result
 // has been lowered, because that expression reads the name this node provides.
@@ -230,8 +230,8 @@ static int lower_carried_name(resolve_state_t *state, const expr_t *call, expr_t
 // its index or -1 after reporting a defect.
 //
 // It is a leaf, so it takes no operand and no carried edge; `tick_of` names the
-// recurrence whose counter it reads and is part of the interning key, which is what keeps
-// a nested recurrence's inner index distinct from its outer one.
+// recurrence whose counter it reads and is part of the interning key, so a nested
+// recurrence's inner index stays distinct from its outer one.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes owner (int) which is the OP_RECUR node whose ticks are counted.
@@ -339,7 +339,7 @@ func_t *find_function(program_t *program, const char *name, const int name_lengt
 // parameter it fills and does not reorder, because reordering would make two spellings of
 // one call; an unlabelled argument stays legal. A step function is skipped here and
 // refused where it lands, because reporting its mismatched `with:` label would pre-empt
-// the better message, that a step is not a value at all.
+// the better message, that a step is not a value.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes function (func_t) which is the function being lowered.
@@ -412,16 +412,16 @@ static int lower_call_arguments(resolve_state_t *state, expr_t *call, int *argum
 // The caller's scope, depth and promise scope are restored before return; the ambient is
 // not saved, because nothing here changes it. A parameter's demand is checked at the call
 // site, on the caller's argument node, so blame names both ends: the demand's span in the
-// callee's signature and the value's span at the call. declare_demand_meet makes a
-// parameter demand and one the caller already wrote on the same value take the stronger
-// of the two rather than the later one. No ambient comes from the declaration, because a
-// declared return lane is a promise checked against the body, and an ambient would pin
-// every fold inside to the promised kernel and make the promise trivially true. Instead
-// the body of a lane-publishing function gets a promise scope, which separates its cone
-// from the caller's without selecting a kernel; a body built under no mark at all would
-// intern with whatever the caller wrote beside it, gaining a consumer no source
-// expression corresponds to, and the escape test would then refuse to pin a producer that
-// never escaped.
+// callee's signature and the value's span at the call. declare_demand nests a parameter
+// demand over any lane the caller already wrote on the same value, so the caller's stated
+// lane is checked against the parameter rather than replaced by it. No ambient comes from
+// the declaration, because a declared return lane is a promise checked against the body,
+// and an ambient would pin every fold inside to the promised kernel and make the promise
+// true by construction. Instead the body of a lane-publishing function gets a promise
+// scope, which separates its cone from the caller's without selecting a kernel; a body
+// built under no mark would intern with whatever the caller wrote beside it, gaining a
+// consumer no source expression corresponds to, and the escape test would then refuse to
+// pin a producer that never escaped.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes function (func_t) which is the function being lowered.
@@ -443,8 +443,8 @@ static int inline_body(
     for (int i = 0; i < function->parameter_count; i++) {
         int supplied = argument_nodes[i];
         if (function->parameters[i].lane != LANE_NONE) {
-            supplied = declare_demand_meet(state, supplied, function->parameters[i].lane,
-                                           function->parameters[i].lane_span);
+            supplied = declare_demand(state, supplied, function->parameters[i].lane,
+                                      function->parameters[i].lane_span);
             if (supplied < 0) {
                 state->depth--;
                 state->scope_count = saved_scope_count;
@@ -557,7 +557,7 @@ int lower_call(resolve_state_t *state, expr_t *call) {
         out = wrap_opaque(state, call, out);
     }
     if (out >= 0 && function->lane != LANE_NONE) {
-        out = declare_return_promise(state, out, function);
+        out = declare_call_promise(state, out, function);
     }
     return out;
 }

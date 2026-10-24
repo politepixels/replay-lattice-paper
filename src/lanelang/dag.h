@@ -62,7 +62,7 @@ typedef enum {
     // unchanged, a select rather than a blend. The evaluator computes only the selected
     // arm per position, but the lane is read off `in` before anything is evaluated, so a
     // mask pinned at `approx` carries `approx` into the result with blame on the mask,
-    // and no rule anywhere mentions this op.
+    // and no rule mentions this op.
     OP_CHOOSE,
 
     // OP_FOLD is a whole-column reduction, whose schedule class says which kernel it
@@ -82,15 +82,14 @@ typedef enum {
     // OP_TICK is the 0-based tick index of the recurrence named by `tick_of`, which is
     // the second parameter of that recurrence's step function. It is a leaf: a tick index
     // is a function of the program rather than of any value, so it takes no operand and
-    // no carried edge, it is `exact`, it is grounded, and carried_depth_at scores it
-    // zero.
+    // no carried edge, it is `exact`, it is grounded, and no carried edge leads from it.
     OP_TICK,
 
     // OP_OPAQUE wraps the result of a call to a function declared `ungrounded`. It has
     // exactly one input, the body's lowered result, and its class is neutral: it computes
     // nothing and its lane is its input's. It exists to record the grounding answer, so
-    // `ground_of_node` answers false for it whatever its input says. It never interns,
-    // which is what keeps `bless` out of the interning key.
+    // `ground_of_node` answers false for it whatever its input says. It never interns, so
+    // `bless` can stay out of the interning key.
     OP_OPAQUE,
 
     // OP_DEMAND carries a demand the source wrote about a value. It has exactly one
@@ -118,7 +117,7 @@ typedef struct {
     // input_count is how many entries of `in` are in use.
     int input_count;
 
-    // carried is the body of an OP_RECUR node, or -1 for every other node. It is the one
+    // carried is the body of an OP_RECUR node, or -1 for every other node. It is the only
     // edge in the graph that may point forward, because a recurrence's body is built
     // after the node it feeds, and it is deliberately not an entry of `in`, whose entries
     // must be strictly earlier than their consumer.
@@ -167,15 +166,23 @@ typedef struct {
     int binary_operator;
 
     // bless is what a `@bless` on this node promises: 0 for none, BLESS_PROMISE for the
-    // bare form, `checksum + 1` for the conditional one. It is only ever non-zero on
-    // OP_SOURCE and OP_OPAQUE, the two kinds a waiver may bind to, and only the bare form
-    // on OP_OPAQUE, because a checksum is verified against the column a source loads and
+    // bare form, `checksum + 1` for the conditional one. It is non-zero only on OP_SOURCE
+    // and OP_OPAQUE, the two kinds a waiver may bind to, and only the bare form on
+    // OP_OPAQUE, because a checksum is verified against the column a source loads and
     // there is no such column behind a call. It is not part of the interning key, and the
     // waiver's kinds must stay the set of kinds dag_intern never interns, because a
     // waiver on a node the interner may hand to a second owner is a promise about a value
     // its writer never saw. The absent value is 0 because the checksum is stored biased
     // by one.
     long long bless;
+
+    // stated_by_binding is 1 on a demand node a binding's qualifier wrote, and 0 on every
+    // other node, a parameter's demand and a call's return promise among them. Healing
+    // stops only at a demand of another lane that a binding wrote, so a lane the source
+    // wrote on a binding bounds what healing may strengthen, while a parameter or a
+    // promise does not keep a private producer from healing. It is not part of the
+    // interning key, and a binding that reuses a node sets it there.
+    int stated_by_binding;
 
     // uses is how many times nodes that reach the function result read this node, counted
     // per operand edge rather than per distinct consumer, plus one for the result itself.
@@ -260,11 +267,11 @@ dagnode_t *dag_at(dag_t *g, int i);
 // Takes i (int) which is the element being read.
 const dagnode_t *dag_at_const(const dag_t *g, int i);
 
-// dag_recount_uses recomputes `uses` across the whole graph.
+// dag_recount_uses recomputes `uses` across the graph.
 //
 // `result` counts as one additional use, so that a value the program returns is live even
-// when no node reads it. heal.c calls this itself, before its pass, because a
-// live-consumer test is only as good as the counts it reads.
+// when no node reads it. heal.c calls this itself, before its pass, because its
+// live-consumer test reads these counts and a stale count gives a wrong answer.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.

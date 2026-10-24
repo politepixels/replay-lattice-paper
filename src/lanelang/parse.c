@@ -258,7 +258,7 @@ static int parse_qualifier_word(const parser_t *parser) {
 
 // record_qualifier stores one qualifier word in `out`, refusing a second of its kind and
 // a lane written before `ungrounded`. Refusing the second arrangement leaves one spelling
-// of one meaning, so the grammar has no ordering rule to discover, only one to obey.
+// of one meaning, so the order is fixed and the parser enforces it.
 //
 // Takes parser (parser_t) which is the parser's diagnostic sink.
 // Takes out (qualifiers_t) which receives the word.
@@ -366,9 +366,9 @@ static int parse_qualifiers(parser_t *parser, qualifiers_t *out) {
 // parse_type accepts a type and discards it. Returns 1 on success, or 0 after reporting a
 // failure.
 //
-// It keeps nothing because nothing reads it: no judgement in this compiler consults a
-// declared type, and the checker's whole subject is the lane. The function stays so that
-// `func main() Banana` is still refused at the point it is written.
+// It keeps nothing, because no judgement in this compiler consults a declared type: the
+// checker's subject is the lane. The function exists so that `func main() Banana` is
+// refused at the point it is written.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static int parse_type(parser_t *parser) {
@@ -511,9 +511,9 @@ static int parse_parameters(parser_t *parser, parameter_t *parameters) {
 // parse_one_binding reads one `@bless(N)? lane? name := expr` binding into `binding`.
 //
 // The waiver is read first and the qualifier second, so `@bless(N) replay x := ...` is
-// the one legal arrangement. `ungrounded` is refused rather than read, because it
-// describes what a function returns, a claim about a body the checker cannot see, while a
-// binding's right-hand side is a body the checker is looking at.
+// legal and the reverse order is not. `ungrounded` is refused here, because it describes
+// what a function returns, a claim about a body the checker cannot see, while a binding's
+// right-hand side is a body the checker is looking at.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes binding (bind_t) which receives the binding read.
@@ -691,9 +691,9 @@ static int parse_func(parser_t *parser, func_t *function) {
 // parse_package_clause reads the `package NAME` clause and keeps nothing from it. Returns
 // 1 on success, or 0 after reporting a failure.
 //
-// The name is validated and discarded, because nothing in this compiler has a second
-// package to tell it apart from: there is no import form, no qualified name and one
-// translation unit. Refusing `package 3` is the whole of what the clause buys.
+// The name is validated and discarded, because this compiler has no second package to
+// tell it apart from: there is no import form, no qualified name and one translation
+// unit. Validating the name refuses `package 3`, and the clause has no other effect.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static int parse_package_clause(parser_t *parser) {
@@ -706,6 +706,27 @@ static int parse_package_clause(parser_t *parser) {
     }
     parse_advance(parser);
     return 1;
+}
+
+// BUILTIN_NAMES is every name `lower_call` answers before it looks a declaration up. A
+// declaration under one of these names would be compiled and never called, so it is
+// refused; a builtin added to `lower_call` belongs here too.
+static const char *const BUILTIN_NAMES[] = {
+    "indices", "integers", "source", "scan", "choose", "iterate", "sum", "isum"
+};
+
+// function_name_is_builtin reports whether `name` is one of BUILTIN_NAMES.
+//
+// Takes name (char) which is the candidate name, not NUL terminated.
+// Takes name_length (int) which is how many bytes of `name` belong to it.
+static int function_name_is_builtin(const char *name, const int name_length) {
+    for (size_t i = 0; i < sizeof BUILTIN_NAMES / sizeof BUILTIN_NAMES[0]; i++) {
+        if ((int) strlen(BUILTIN_NAMES[i]) == name_length
+            && memcmp(BUILTIN_NAMES[i], name, (size_t) name_length) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // function_name_is_taken reports whether `name` is already declared among the first
@@ -747,6 +768,14 @@ static int parse_functions(parser_t *parser, func_t *functions) {
         if (!parse_func(parser, &functions[count])) {
             break;
         }
+        if (function_name_is_builtin(functions[count].name, functions[count].name_length)) {
+            diagnostic_error(parser->diagnostics, functions[count].span,
+                       "function '%.*s' has a builtin's name, and every call resolves to the "
+                       "builtin, so this body is compiled and never run",
+                       functions[count].name_length, functions[count].name);
+            parser->failed = 1;
+            break;
+        }
         if (function_name_is_taken(functions, count, functions[count].name,
                                    functions[count].name_length)) {
             diagnostic_error(parser->diagnostics, functions[count].span,
@@ -761,8 +790,8 @@ static int parse_functions(parser_t *parser, func_t *functions) {
     return count;
 }
 
-// parse_abandon releases the parser's arena and returns NULL, which is every failure path
-// out of parse_program.
+// parse_abandon releases the parser's arena and returns NULL; parse_program fails through it
+// once the arena exists.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static program_t *parse_abandon(parser_t *parser) {

@@ -89,8 +89,8 @@ typedef enum {
     // associative there, and the operation enforces its own domain.
     OPC_FOLD_INTEGER,
 
-    // OPC_FOLD_REPLAY is a fixed-tree fold, which caps the result at LANE_REPLAY and
-    // folds its leaves concurrently.
+    // OPC_FOLD_REPLAY is a fixed-tree fold, which caps the result at LANE_REPLAY, and
+    // whose leaf blocks a parallel backend may fold concurrently.
     OPC_FOLD_REPLAY,
 
     // OPC_FOLD_APPROX is a free reduction, which reassociates as the deployment pleases,
@@ -107,8 +107,8 @@ typedef enum {
     OPC_SCAN_APPROX
 } opclass_t;
 
-// bitsdep_t is what a kernel's output bits are a function of, the one question every row
-// of the op-class table answers.
+// bitsdep_t is what a kernel's output bits are a function of, the question each row of the
+// op-class table answers.
 typedef enum {
     // BITS_NEUTRAL is the kernel performs no reassociable combination of its own, so
     // whatever agreement its operands had, its result keeps. It is a closure property,
@@ -152,7 +152,7 @@ static inline lane_t bitsdep_lane(const bitsdep_t dependency) {
 //
 // This is the table itself: one row per kernel, and nothing else in the language decides
 // a class. Arms that repeat an earlier answer are deliberate and stay separate, because
-// the repetition is what shows the class follows from what the bits depend on.
+// the repetition shows that the class follows from what the bits depend on.
 //
 // Takes op_class (opclass_t) which is the schedule class the kernel carries.
 static inline bitsdep_t opclass_bits(const opclass_t op_class) {

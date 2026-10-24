@@ -24,8 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ARGV_EXPECTED is the argument count of the one command line the driver accepts: argv[0]
-// the program, argv[1] the mode, argv[2] the source file.
+// ARGV_EXPECTED is the argument count of the command line the driver accepts: argv[0] the
+// program, argv[1] the mode, argv[2] the source file.
 #define ARGV_EXPECTED 3
 
 // EXIT_ACCEPT is the program is well formed and every demand it states was satisfied.
@@ -127,9 +127,7 @@ static int parse_options(const int argc, char **argv, options_t *options) {
     return 1;
 }
 
-// checking_enabled reports whether the declaration check should run. The kill switch is
-// the environment variable named by LANELANG_KILL_ENV, and it disables the check when set
-// to "1".
+// checking_enabled reports whether the declaration checks should run.
 static int checking_enabled(void) {
     const char *kill = getenv(LANELANG_KILL_ENV);
     return !(kill && strcmp(kill, "1") == 0);
@@ -199,12 +197,12 @@ static void report_refusal(const report_t *report) {
 // run_check renders the verdict for "check": the diagnostics and a count when the program
 // was rejected, and one acceptance line otherwise.
 //
-// Malformed is asked first because it is the answer that there is no answer: the sweep
-// sets it when an operand pointed forward or when the iteration never settled, and in
-// both cases `computed` holds nothing, so reading a lane out of it and printing an
-// acceptance would be a silent wrong answer. The accept path still renders, because a
-// program the checker accepts may carry notes, such as a declaration that reserves a fact
-// rather than stating one.
+// Malformed is asked first because it means the check produced no answer: the sweep sets
+// it when an operand pointed forward or when the iteration never settled, and in both
+// cases `computed` holds nothing, so reading a lane out of it and printing an acceptance
+// would be a silent wrong answer. The accept path still renders, because a program the
+// checker accepts may carry notes, such as a declaration that reserves a fact rather than
+// stating one.
 //
 // Takes report (report_t) which is everything the modes read.
 static int run_check(const report_t *report) {
@@ -346,10 +344,10 @@ static int report_malformed(diagnostic_t *diagnostics) {
 // report_declaration_refusal renders what the standalone declaration pass found and
 // returns EXIT_REJECT.
 //
-// A demand broken in a function no call reaches is the same lane verdict as one broken in
-// `main`, so this answers EXIT_REJECT; routing it through report_malformed would claim
-// the program never resolved. The pass checks every declaration the entry does not reach,
-// so both counts may be non-zero in one run, and a weaker value is counted apart from an
+// A demand broken in a declaration checked on its own is the same lane verdict as one
+// broken in `main`, so this answers EXIT_REJECT; routing it through report_malformed would
+// claim the program never resolved. The pass checks every declaration but the entry, so
+// both counts may be non-zero in one run, and a weaker value is counted apart from an
 // ungrounded demand.
 //
 // Takes diagnostics (diagnostic_t) which is where diagnostics are collected.
@@ -358,14 +356,45 @@ static int report_declaration_refusal(diagnostic_t *diagnostics, const check_res
     diagnostic_render(diagnostics, stderr);
     if (found->violations > 0) {
         fprintf(stderr,
-                "lanelang: %d determinism lane violation%s in a declaration no call reaches\n",
+                "lanelang: %d determinism lane violation%s in a declaration checked on its own\n",
                 found->violations, found->violations == 1 ? "" : "s");
     }
     if (found->ungrounded > 0) {
-        fprintf(stderr, "lanelang: %d ungrounded demand%s in a declaration no call reaches\n",
+        fprintf(stderr, "lanelang: %d ungrounded demand%s in a declaration checked on its own\n",
                 found->ungrounded, found->ungrounded == 1 ? "" : "s");
     }
     return EXIT_REJECT;
+}
+
+// run_program checks every declaration on its own, resolves the entry, and answers with
+// the strongest verdict either produced.
+//
+// Takes options (options_t) which is what this invocation was asked to do.
+// Takes program (program_t) which is the parsed program.
+// Takes diagnostics (diagnostic_t) which is where diagnostics are collected.
+// Takes declaring (diagnostic_t) which is where the standalone pass reports, `diagnostics`
+// itself unless the kill switch is set.
+static int run_program(const options_t *options, program_t *program, diagnostic_t *diagnostics,
+                       diagnostic_t *declaring) {
+    int declaration_malformed = 0;
+    check_result_t declaration_found = check_result_none();
+    const int declarations_hold = resolve_verify_declarations(program, "main", declaring,
+                                                              &declaration_malformed,
+                                                              &declaration_found);
+    if (declaration_malformed) {
+        return report_malformed(declaring);
+    }
+    resolved_t resolved = resolve_program(program, "main", diagnostics);
+    int rc;
+    if (resolved.status != RESOLVE_OK) {
+        rc = report_malformed(diagnostics);
+    } else if (!declarations_hold && checking_enabled()) {
+        rc = report_declaration_refusal(declaring, &declaration_found);
+    } else {
+        rc = run_resolved(options, &resolved, diagnostics);
+    }
+    dag_free(resolved.dag);
+    return rc;
 }
 
 // run_lanelang reads, parses, resolves and then runs the requested subcommand.
@@ -387,23 +416,12 @@ static int run_lanelang(const options_t *options) {
         return EXIT_MALFORMED;
     }
 
-    int declaration_rejected = 0;
-    check_result_t declaration_found = check_result_none();
-    if (!resolve_verify_declarations(program, "main", diagnostics, &declaration_rejected,
-                                     &declaration_found)) {
-        const int rc = declaration_rejected
-                           ? report_declaration_refusal(diagnostics, &declaration_found)
-                           : report_malformed(diagnostics);
-        ast_free(program);
-        diagnostic_free(diagnostics);
-        free(source);
-        return rc;
+    const int checking = checking_enabled();
+    diagnostic_t *declaring = checking ? diagnostics : diagnostic_new(options->path, source);
+    const int rc = run_program(options, program, diagnostics, declaring);
+    if (declaring != diagnostics) {
+        diagnostic_free(declaring);
     }
-
-    resolved_t resolved = resolve_program(program, "main", diagnostics);
-    const int rc = resolved.status == RESOLVE_OK ? run_resolved(options, &resolved, diagnostics)
-                                                 : report_malformed(diagnostics);
-    dag_free(resolved.dag);
     ast_free(program);
     diagnostic_free(diagnostics);
     free(source);

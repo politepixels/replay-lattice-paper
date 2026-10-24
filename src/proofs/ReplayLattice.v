@@ -358,13 +358,15 @@ Qed.
 
 Theorem theorem2_non_recovery :
   forall (L : nat -> lane) (n : node) (u : nat),
-    In u (inputs n) ->
+    In u (inputs n) \/ carried n = Some u ->
     L u = Approx ->
     node_lane L n = Approx.
 Proof.
-  intros L n u Hin Hu.
+  intros L n u Hreads Hu.
   assert (H : Approx <=l node_lane L n).
-  { rewrite <- Hu. apply node_lane_ge_input, Hin. }
+  { rewrite <- Hu. destruct Hreads as [Hin | Hc].
+    - apply node_lane_ge_input, Hin.
+    - apply node_lane_ge_carried, Hc. }
   unfold lane_le in H. rewrite join_approx_l in H. congruence.
 Qed.
 
@@ -385,7 +387,7 @@ Inductive has_lane (P : prog) : nat -> lane -> Prop :=
 Definition acyclic (P : prog) : Prop :=
   forall i n, nth_error P i = Some n -> carried n = None.
 
-Lemma lemma0_sound :
+Lemma lemma1_sound :
   forall P L,
     wf P ->
     acyclic P ->
@@ -423,7 +425,7 @@ Proof.
       * eapply le_trans; [ apply Hpt; left; reflexivity | apply join_ub_r ].
 Qed.
 
-Lemma lemma0_least :
+Lemma lemma1_least :
   forall P L,
     wf P ->
     sound_assignment P L ->
@@ -650,7 +652,7 @@ Proof.
   rewrite <- (Hstab i). simpl. unfold step. rewrite Hnth. reflexivity.
 Qed.
 
-Theorem lemma0_least_fixed_point :
+Theorem lemma1_least_fixed_point :
   forall P,
     exists L,
       sound_assignment P L /\

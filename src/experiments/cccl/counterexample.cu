@@ -26,7 +26,7 @@ void compose(float *in, float *mid, float *out) {
     // Produced under a schedule nobody pinned.
     (void) cub::DeviceReduce::Reduce(in, mid, 100, cuda::std::plus<float>{}, 0.0f,
                                      ex::require(det::not_guaranteed));
-    // Consumed where run-to-run determinism is required. No diagnostic, here or anywhere.
+    // Consumed where run-to-run determinism is required. Neither call produces a diagnostic.
     (void) cub::DeviceReduce::Reduce(mid, out, 1, cuda::std::plus<float>{}, 0.0f,
                                      ex::require(det::run_to_run));
 }

@@ -22,8 +22,7 @@
 // its own.
 //
 // This is the op-class table for reductions; everything else in the language is neutral.
-// An unqualified fold and an `approx` one both reassociate freely, which is why they
-// share an arm.
+// An unqualified fold and an `approx` one both reassociate freely, so they share an arm.
 //
 // Takes ambient (lane_t) which is the lane in force at this point.
 // Takes ordered (int) which is whether the fold carried the order dial.
@@ -40,10 +39,10 @@ static opclass_t fold_class(const lane_t ambient, const int ordered) {
 
 // scan_class returns the schedule class a scan takes under the current ambient.
 //
-// The same question as fold_class, answered the same way, which is the point of
-// re-carving the table on kernels: a second family needs no second argument. The order
-// dial has no scan realisation here, which is why refuse_order_argument declines it
-// rather than letting the call fall quietly to the fixed-block kernel.
+// The same question as fold_class, answered the same way: the table is carved on kernels,
+// so a second family needs no second argument. The order dial has no scan realisation
+// here, so refuse_order_argument declines it rather than letting the call fall quietly to
+// the fixed-block kernel.
 //
 // Takes ambient (lane_t) which is the lane in force at this point.
 static opclass_t scan_class(const lane_t ambient) {
@@ -62,9 +61,9 @@ int call_names(const expr_t *call, const char *name) {
     return names_equal(call->name, call->name_length, name, (int) strlen(name));
 }
 
-// INTEGER_EXACT_LIMIT is 2^53, the point above which every double is already an integer.
-// Below it, integer addition in double is `exact` and so associative, which is what lets
-// the free order and the serial order agree.
+// INTEGER_EXACT_LIMIT is 2^53, above which every double is already an integer. Below it,
+// integer addition in double is `exact` and therefore associative, so the free order and
+// the serial order agree.
 #define INTEGER_EXACT_LIMIT 9007199254740992.0
 
 // count_is_whole reports whether a non-negative double is an integer. Doubles at 2^53 and
@@ -79,13 +78,13 @@ int count_is_whole(const double value) {
 // `out`. The count must be a numeric literal, non-negative and whole; anything else is
 // reported as a structural defect and 0 is returned.
 //
-// The label is checked rather than assumed, because reading argument 0 by position alone
-// would accept any one argument as the count. A count that is not a literal is accepted
-// and `out` is NaN, which is what lets a generator inside a declaration take a parameter
-// as its length: the standalone pass lowers every function with its parameters as leaves,
-// and a parameter has no value at that point. Such a call checks and cannot run, because
-// eval_materialise_indices tests for NaN first and fails the evaluation; the lane
-// judgement never reads the count, so nothing it decides depends on the NaN.
+// The label is checked, because reading argument 0 by position alone would accept any one
+// argument as the count. A count that is not a literal is accepted and `out` is NaN, so a
+// generator inside a declaration can take a parameter as its length: the standalone pass
+// lowers every function with its parameters as leaves, and a parameter has no value at
+// that point. Such a call checks and cannot run, because eval_materialise_indices tests
+// for NaN first and fails the evaluation; the lane judgement never reads the count, so
+// nothing it decides depends on the NaN.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -135,8 +134,8 @@ static int generator_count(resolve_state_t *state, const expr_t *call, const cha
 // out-of-memory defect must be distinguishable from an undefined name, never a bare
 // malformed verdict over an empty sink.
 //
-// It stamps the promise scope, and it is the one funnel every node passes through, so the
-// mark cannot be forgotten by a node kind added later. The field is part of the interning
+// It stamps the promise scope, and every interned node passes through it, so the mark
+// cannot be forgotten by a node kind added later. The field is part of the interning
 // key, so it has to be set before the node is offered for interning.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
@@ -157,9 +156,9 @@ int intern_or_report(resolve_state_t *state, const dagnode_t *node, const span_t
 // oracle-order kernel to honour it with.
 //
 // The setting is refused rather than ignored, because written on the call it is a
-// request, and the honest answer to a request that cannot be met is to refuse it. Every
-// operation with no oracle-order kernel calls this, and the reason differs by operation,
-// which is why the caller supplies it.
+// request, and this operation cannot meet it. A generator, a source, a scan and an
+// integer fold call this, each supplying its own reason; `choose` and `iterate` refuse the
+// label through their own argument checks.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -184,8 +183,8 @@ static int refuse_order_argument(resolve_state_t *state, expr_t *call, const cha
 //
 // A label the builtin does not read is a claim nothing checks: `sum(banana: x)` would
 // lower exactly as `sum(x)`, leaving the reader to trust a word the compiler never looked
-// at. Refusing it is the rule the checker applies everywhere else: a name it does not
-// recognise is an error, not a decoration.
+// at. Refusing it follows the checker's general rule: a name it does not recognise is an
+// error, not a decoration.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -242,8 +241,8 @@ int lower_indices(resolve_state_t *state, expr_t *call, const int integers) {
 // Takes call (expr_t) which is the call site being resolved.
 int lower_scan(resolve_state_t *state, expr_t *call) {
     if (!refuse_order_argument(state, call,
-                               "a scan lowers to the fixed-block form whatever the dial says, and "
-                               "the blocks are already serial")) {
+                               "there is no oracle-order scan kernel, and the fixed-block scan is "
+                               "replay rather than the serial order")) {
         return -1;
     }
     if (call->arg_count != 1) {
@@ -275,10 +274,9 @@ int lower_scan(resolve_state_t *state, expr_t *call) {
 // choose_argument returns the value of `call`'s argument at `position`, requiring it to
 // carry `label`, or NULL after reporting a defect.
 //
-// The labels are enforced rather than decorative. choose's three arguments are all
-// columns and none of them is interchangeable with another, so a positional call gives a
-// reader nothing to check the order against, and swapping the arms inverts the program in
-// silence.
+// The labels are enforced. choose's three arguments are all columns and none of them is
+// interchangeable with another, so a positional call gives a reader nothing to check the
+// order against, and swapping the arms inverts the program in silence.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -306,10 +304,10 @@ static expr_t *choose_argument(
 // lower_choose builds the node for the choose() builtin and returns its index, or -1
 // after reporting a defect.
 //
-// Three operands and no fourth thing: the mask goes in `in[0]` beside the two arms, and
-// the join sweep joins every entry of `in` without asking what any of them means, so the
-// condition's lane reaches the result through the rule that was already there. Both arms
-// are lowered whatever the mask says, because both arms are in the graph.
+// The mask is an ordinary operand: it goes in `in[0]` beside the two arms, and the join
+// sweep joins every entry of `in` without asking what any of them means, so the
+// condition's lane reaches the result through the ordinary join, with no rule of its own.
+// Both arms are lowered whatever the mask says, because both arms are in the graph.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -365,8 +363,8 @@ int lower_choose(resolve_state_t *state, expr_t *call) {
 // because transparency is a claim about combination and a leaf combines nothing;
 // `grounded` is what speaks to where a leaf's value came from. It is not interned: two
 // source() calls are two values, because nothing says the world hands back the same
-// column twice, and merging them would assume exactly the property the grounding
-// judgement exists to refuse.
+// column twice, and merging them would assume the property the grounding judgement exists
+// to refuse.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -467,20 +465,24 @@ static void control_alias_dial_onto_ambient(resolve_state_t *state, const int as
     }
 }
 
-// control_alias_dial_onto_result applies the second half of the aliasing control's break.
+// control_alias_dial_onto_result applies the second half of the aliasing control's break,
+// and returns the node the call stands for.
 //
-// The alias must declare the demand rather than merely pick the kernel, because healing
-// is driven by what a node declares.
+// The alias must declare the demand as well as pick the kernel, because healing is driven
+// by what a node declares, and the call must stand for the demand node, or the demand
+// hangs off the graph and no walk from the result ever reaches it.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes out (int) which is the fold's node, or -1 when it could not be built.
 // Takes asked_for_order (int) which is whether the fold carried `order: oracle`.
 // Takes at (span_t) which is the call the demand would be blamed on.
-static void control_alias_dial_onto_result(resolve_state_t *state, const int out,
-                                           const int asked_for_order, const span_t at) {
+// Returns the demand node under the alias, and `out` otherwise.
+static int control_alias_dial_onto_result(resolve_state_t *state, const int out,
+                                          const int asked_for_order, const span_t at) {
     if (CONTROL_DIAL_ALIASES_DEMAND && out >= 0 && asked_for_order) {
-        (void) declare_demand_meet(state, out, LANE_EXACT, at);
+        return declare_demand(state, out, LANE_EXACT, at);
     }
+    return out;
 }
 
 // lower_sum builds the node for the sum() and isum() builtins and returns its index, or
@@ -535,6 +537,5 @@ int lower_sum(resolve_state_t *state, expr_t *call, const int integer) {
     node.label = call->name;
     node.label_length = call->name_length;
     const int out = intern_or_report(state, &node, call->span);
-    control_alias_dial_onto_result(state, out, asked_for_order, call->span);
-    return out;
+    return control_alias_dial_onto_result(state, out, asked_for_order, call->span);
 }

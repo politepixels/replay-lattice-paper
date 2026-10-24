@@ -113,7 +113,8 @@ static void report_violation(
 // than of the world.
 //
 // A literal and a generated column are fixed by the program, and a parameter is the
-// caller's obligation, so it is grounded by assumption from inside the callee. OP_SOURCE
+// caller's obligation, so it is grounded by assumption from inside the callee; the entry,
+// which has no caller, may not declare one. OP_SOURCE
 // reaches out for a value nobody fixed, so it is the only leaf that may not carry a
 // demand without a waiver; a call declared `ungrounded` is not a leaf and is decided in
 // ground_of_node.
@@ -237,11 +238,11 @@ static int ground_pass(const dag_t *g, const int count, char *grounded) {
 // see is grounded.
 //
 // Over-declaring is legal, because a library author may reserve the right to reach the
-// world later without breaking callers, and forcing the answer false only ever refuses
-// more programs; the note changes no verdict and names the reservation where it is
-// written. The test against GROUND_FIXED is an equality and not a mask, because a body
-// holding a blessed source carries the waiver bit alone and only a body the program
-// itself fixes is an over-declaration.
+// world later without breaking callers, and forcing the answer false can only refuse more
+// programs; the note changes no verdict and names the reservation where it is written.
+// The test against GROUND_FIXED is an equality and not a mask, because a body holding a
+// blessed source carries the waiver bit alone and only a body the program itself fixes is
+// an over-declaration.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -271,8 +272,8 @@ static void report_over_declared_opaque(const dag_t *g, const int count,
 // already visited, or out of range.
 //
 // It walks operands depth-first and stops at the first ungrounded leaf, which is where
-// the value entered the program and the only place a reader can act. `seen` is a cycle
-// guard rather than an optimisation, because the carried edge may point forward, so a
+// the value entered the program and where a reader can act. `seen` is a cycle guard
+// rather than an optimisation, because the carried edge may point forward, so a
 // recurrence whose body names the binding it defines would recurse until the stack ran
 // out.
 //
@@ -329,7 +330,7 @@ static int first_ungrounded_leaf(const dag_t *g, const int count, const char *gr
 // report_ungrounded reports a declaration refused because its cone reaches a leaf the
 // program does not fix.
 //
-// It is deliberately not the two-span lane-violation shape, because no guarantee was ever
+// It does not use the two-span lane-violation shape, because no guarantee was ever
 // available to lose, and a lost-guarantee reading invites the repair that does not work,
 // which is pinning a producer; a source is ungrounded whatever qualifier it carries. The
 // advice names the waiver that will be accepted: a source loads a column, so a checksum
@@ -355,10 +356,10 @@ static void report_ungrounded(
 
     const char *const waiver = source->op == OP_OPAQUE ? "@bless" : "@bless(...)";
     diagnostic_error(d, primary,
-                "%s demands a grounded cone, and this value is not grounded. The bits do not move "
-                "with the schedule here, they move with the world: vouch for it with "
-                "%s on the binding that names it, take the value as a parameter, which "
-                "makes it the caller's obligation, or weaken the demand to %s",
+                "%s demands a cone the program fixes or a blessing vouches for, and this value "
+                "is neither. The bits do not move with the schedule here, they move with the "
+                "world: vouch for it with %s on the binding that names it, take the value as a "
+                "parameter, which makes it the caller's obligation, or weaken the demand to %s",
                 lane_name(node->declared), waiver, lane_name(LANE_APPROX));
     if (source->label_length > 0) {
         diagnostic_note(d, source->span,
@@ -385,55 +386,92 @@ static int dag_has_carried_edge(const dag_t *g, const int count) {
     return 0;
 }
 
-// carried_depth_at is the greatest number of carried edges on any one path through the
-// graph from `at`: the recurrence nesting depth.
+// seed_layer settles the carried targets the previous layer reached and stacks the ones
+// not already settled, returning how many it stacked.
 //
-// Depth is what bounds the sweep. Within one pass every operand is already settled,
-// because operands are strictly earlier; the carried edge is the only one that may point
-// forward, so it is read stale and information travels backwards exactly one carried edge
-// per pass. A recurrence nested d deep therefore needs d passes before its outermost lane
-// reads anything true, so height bounds how far a lane moves and depth bounds how long
-// the news takes to arrive. `seen` carries the depth already computed for a node, so the
-// walk is linear over a graph that shares producers, and doubles as the cycle guard the
-// carried edge makes necessary.
+// Takes next (int) which holds the carried targets the previous layer reached.
+// Takes pending (int) which is how many it holds.
+// Takes layer (int) which is the count of carried edges crossed to reach them.
+// Takes distance (int) which holds each node's count, -1 for a node not reached.
+// Takes stack (int) which receives the nodes newly settled.
+static int seed_layer(const int *next, const int pending, const int layer, int *distance,
+                      int *stack) {
+    int top = 0;
+    for (int k = 0; k < pending; k++) {
+        if (distance[next[k]] < 0) {
+            distance[next[k]] = layer;
+            stack[top++] = next[k];
+        }
+    }
+    return top;
+}
+
+// close_layer settles everything the stacked nodes read through operands alone, at the
+// same count, and collects the carried targets they read for the next layer.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
-// Takes at (int) which is the node to start from.
-// Takes seen (int) which marks the nodes already visited.
-static int carried_depth_at(const dag_t *g, const int count, const int at, int *seen) {
-    if (at < 0 || at >= count) {
-        return 0;
+// Takes layer (int) which is the count every node settled here receives.
+// Takes distance (int) which holds each node's count, -1 for a node not reached.
+// Takes stack (int) which holds the nodes to expand, `stacked` of them.
+// Takes stacked (int) which is how many the stack holds.
+// Takes next (int) which receives the carried targets reached.
+// Returns how many carried targets it collected.
+static int close_layer(const dag_t *g, const int count, const int layer, int *distance,
+                       int *stack, const int stacked, int *next) {
+    int top = stacked;
+    int pending = 0;
+    while (top > 0) {
+        const dagnode_t *node = dag_at_const(g, stack[--top]);
+        for (int k = 0; k < node->input_count; k++) {
+            const int in = node->in[k];
+            if (in >= 0 && in < count && distance[in] < 0) {
+                distance[in] = layer;
+                stack[top++] = in;
+            }
+        }
+        const int carried = node->carried;
+        if (carried >= 0 && carried < count && distance[carried] < 0 && pending < count) {
+            next[pending++] = carried;
+        }
     }
-    if (seen[at] >= 0) {
-        return seen[at];
-    }
-    seen[at] = 0;
+    return pending;
+}
 
-    const dagnode_t *node = dag_at_const(g, at);
+// carried_distances_from records, for every node `from` reads, the fewest carried edges
+// on any path from `from` back to it, and returns the greatest of those counts.
+//
+// Takes g (dag_t) which is the graph being walked.
+// Takes count (int) which is how many nodes the graph holds.
+// Takes from (int) which is the node the search starts at.
+// Takes distance (int) which receives each node's count, -1 for a node not reached.
+// Takes stack (int) which is scratch space for `count` nodes.
+// Takes next (int) which is scratch space for `count` nodes.
+// Returns the greatest count recorded.
+static int carried_distances_from(const dag_t *g, const int count, const int from,
+                                  int *distance, int *stack, int *next) {
+    for (int i = 0; i < count; i++) {
+        distance[i] = -1;
+    }
     int deepest = 0;
-    for (int k = 0; k < node->input_count; k++) {
-        const int below = carried_depth_at(g, count, node->in[k], seen);
-        if (below > deepest) {
-            deepest = below;
+    int pending = 1;
+    next[0] = from;
+    for (int layer = 0; pending > 0; layer++) {
+        const int top = seed_layer(next, pending, layer, distance, stack);
+        if (top > 0) {
+            deepest = layer;
         }
+        pending = close_layer(g, count, layer, distance, stack, top, next);
     }
-    if (node->carried >= 0) {
-        const int below = carried_depth_at(g, count, node->carried, seen);
-        if (below + 1 > deepest) {
-            deepest = below + 1;
-        }
-    }
-    seen[at] = deepest;
     return deepest;
 }
 
-// dag_carried_depth is the recurrence nesting depth of the whole graph, or 0 when it
-// holds no carried edge.
+// dag_carried_depth is the most carried edges a change must cross to reach any node it
+// reaches, counting the fewest along any path, or 0 when the graph holds no carried edge.
 //
-// Without the scratch array the depth cannot be computed, and a bound guessed from
-// nothing is worse than a conservative one, so it falls back to `count`, which no acyclic
-// graph can exceed.
+// Without the scratch arrays the count cannot be computed, and a guessed bound is worse
+// than a conservative one, so it falls back to `count`, which no shortest path can
+// exceed.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -441,22 +479,26 @@ static int dag_carried_depth(const dag_t *g, const int count) {
     if (count <= 0) {
         return 0;
     }
-    int *seen = (int *) malloc(sizeof(int) * (size_t) count);
-    if (!seen) {
+    int *distance = (int *) malloc(sizeof(int) * (size_t) count);
+    int *stack = (int *) malloc(sizeof(int) * (size_t) count);
+    int *next = (int *) malloc(sizeof(int) * (size_t) count);
+    if (!distance || !stack || !next) {
+        free(distance);
+        free(stack);
+        free(next);
         return count;
-    }
-    for (int i = 0; i < count; i++) {
-        seen[i] = -1;
     }
 
     int deepest = 0;
     for (int i = 0; i < count; i++) {
-        const int here = carried_depth_at(g, count, i, seen);
+        const int here = carried_distances_from(g, count, i, distance, stack, next);
         if (here > deepest) {
             deepest = here;
         }
     }
-    free(seen);
+    free(distance);
+    free(stack);
+    free(next);
     return deepest;
 }
 
@@ -465,7 +507,7 @@ static int dag_carried_depth(const dag_t *g, const int count) {
 //
 // The carried edge is joined here and nowhere else. It is read from `computed` rather
 // than from `in`, so join_input_lanes never sees an index it would have to refuse, and
-// the sweep's strictly-earlier precondition stays literally true.
+// the sweep's strictly-earlier precondition stays true.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -652,8 +694,8 @@ static void check_declarations(
 // report_malformed_sweep renders the refusal for a sweep that would not run, blaming the
 // node it stopped at.
 //
-// It is deliberately not the lane-violation shape, because the failure is a property of
-// the graph rather than of a path through it, so there is no cause span to walk to.
+// It does not use the lane-violation shape, because the failure is a property of the
+// graph and not of a path through it, so there is no cause span to walk to.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -743,9 +785,9 @@ void lattice_compute_lanes(dag_t *g, const int count, lane_t *computed) {
 // count_ungrounded_nodes returns how many of `count` nodes the grounding sweep left
 // ungrounded.
 //
-// It reads bit 0, the fact, and deliberately not the whole byte, because a blessed node
-// settles at GROUND_BLESSED, which is non-zero, so counting truthiness would report a
-// blessed cone as grounded.
+// It reads bit 0, the fact, and not the whole byte, because a blessed node settles at
+// GROUND_BLESSED, which is non-zero, so counting truthiness would report a blessed cone
+// as grounded.
 //
 // Takes grounded (char) which is the grounding sweep's per-node result.
 // Takes count (int) which is how many nodes the graph has.
@@ -762,15 +804,15 @@ static int count_ungrounded_nodes(const char *grounded, const int count) {
 //
 // The sweep seeds at the join identity, because a carried edge is read before the node it
 // points at has been visited, and starting at the identity makes the iteration climb
-// towards the least fixed point. The ceiling is the loosest provable bound, count *
-// (LANE_CHAIN_HEIGHT - 1) + 1 passes, deliberately looser than the tight bound the
-// fixture check asserts, so a regression in the measurement stays a loud failure there
-// rather than a wrong answer here. Exhaustion is recorded as a malformed graph and
-// reported, because a refusal that renders as an acceptance is the failure mode this file
-// exists to prevent. The grounding sweep runs to its own fixed point for the same reason,
-// and failing to allocate its scratch buffer refuses rather than continuing, because
-// passing NULL through to check_declarations would skip the grounding judgement for every
-// declaration and then report the result as though it had run.
+// towards the least fixed point. The ceiling is the loosest provable bound,
+// count * (LANE_CHAIN_HEIGHT - 1) + 1 passes, looser than the tight bound the fixture
+// check asserts, so a regression in the measurement stays a loud failure there rather
+// than a wrong answer here. Exhaustion is recorded as a malformed graph and reported,
+// because a refusal must not render as an acceptance. The grounding sweep runs to its own
+// fixed point for the same reason, and failing to allocate its scratch buffer refuses
+// rather than continuing, because passing NULL through to check_declarations would skip
+// the grounding judgement for every declaration and then report the result as though it
+// had run.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.

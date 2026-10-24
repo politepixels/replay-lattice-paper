@@ -82,9 +82,9 @@ write_assumptions_query() {
 Require Import ReplayLattice.
 Print Assumptions theorem1.
 Print Assumptions theorem2_non_recovery.
-Print Assumptions lemma0_sound.
-Print Assumptions lemma0_least.
-Print Assumptions lemma0_least_fixed_point.
+Print Assumptions lemma1_sound.
+Print Assumptions lemma1_least.
+Print Assumptions lemma1_least_fixed_point.
 Print Assumptions iter_converges.
 Print Assumptions declaration_sound.
 Print Assumptions grounding_sound.

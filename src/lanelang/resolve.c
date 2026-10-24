@@ -60,7 +60,7 @@ int scope_bind(resolve_state_t *state, const char *name, const int name_length,
 }
 
 // demand_carried_by returns the demand `node` already carries, and the value underneath
-// it, so a second demand about the same value can be met with the first.
+// it, so a later demand or promise about the same value can be compared with the first.
 //
 // Takes dag (dag_t) which is the graph being walked.
 // Takes node (int) which is the node under examination.
@@ -78,16 +78,6 @@ static lane_t demand_carried_by(const dag_t *dag, const int node, int *inner) {
 
 // wrap_demand builds the node that carries `demand` about `value`, and returns its index.
 //
-// A demand is about a value other names may already hold, so it rides on a node of its
-// own: written onto the shared value it would reach every other name and pin a fold the
-// source never demanded, and because `declared` is in the interning key it would also
-// decide which twins merge by the order the bindings were written in. A second demand
-// about one value meets the first rather than nesting, the stronger winning, and the meet
-// builds a fresh wrapper over the same inner value because the wrapper already there may
-// itself be shared. The label is the lane rather than the inner node's label, which would
-// read `b` or `sum` depending on whether a binding had already renamed the fold it sits
-// over; a binding that names this node relabels it afterwards.
-//
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes value (int) which is the node the demand is about.
 // Takes demand (lane_t) which is the lane the source demanded.
@@ -97,23 +87,8 @@ static int wrap_demand(resolve_state_t *state, const int value, const lane_t dem
                        const span_t at) {
     int inner = value;
     const lane_t already = demand_carried_by(state->dag, value, &inner);
-    const lane_t want = (already == LANE_NONE || demand < already) ? demand : already;
-    const dagnode_t *under = dag_at_const(state->dag, inner);
-    const char *const named_for = lane_name(want);
-
-    dagnode_t node;
-    dag_node_init(&node);
-    node.op = OP_DEMAND;
-    node.op_class = OPC_NEUTRAL;
-    node.in[0] = inner;
-    node.input_count = 1;
-    node.lane = state->ambient;
-    node.span = under->span;
-    node.label = named_for;
-    node.label_length = (int) strlen(named_for);
-    node.declared = want;
-    node.declared_span = at;
 #ifdef LANELANG_DEMAND_STAMPS_NODE
+    const lane_t want = (already == LANE_NONE || demand < already) ? demand : already;
     dagnode_t *target = dag_at(state->dag, inner);
     if (target->declared == LANE_NONE || want < target->declared) {
         target->declared = want;
@@ -121,33 +96,43 @@ static int wrap_demand(resolve_state_t *state, const int value, const lane_t dem
     }
     return inner;
 #else
+    if (already == demand) {
+        return value;
+    }
+    const dagnode_t *under = dag_at_const(state->dag, value);
+    const char *const named_for = lane_name(demand);
+
+    dagnode_t node;
+    dag_node_init(&node);
+    node.op = OP_DEMAND;
+    node.op_class = OPC_NEUTRAL;
+    node.in[0] = value;
+    node.input_count = 1;
+    node.lane = state->ambient;
+    node.span = under->span;
+    node.label = named_for;
+    node.label_length = (int) strlen(named_for);
+    node.declared = demand;
+    node.declared_span = at;
     return intern_or_report(state, &node, at);
 #endif
 }
 
-// declare_demand_meet applies a demand stated about a value that may already carry one,
-// and returns the node that carries the strongest demand stated anywhere on the value.
+// declare_demand applies a demand stated about a value that may already carry one, and
+// returns the node that carries it.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes node (int) which is the value the demand is about.
 // Takes demand (lane_t) which is the lane the source demanded.
 // Takes at (span_t) which is where the demand was written.
 // Returns the demand node's index, or -1 after reporting a defect.
-int declare_demand_meet(resolve_state_t *state, const int node, const lane_t demand,
-                        const span_t at) {
+int declare_demand(resolve_state_t *state, const int node, const lane_t demand,
+                   const span_t at) {
     return wrap_demand(state, node, demand, at);
 }
 
 // declare_return_promise applies a function's declared return lane to the value it
 // returns, reporting a body that promises less than the signature does.
-//
-// A promise is not a meet, because the body's own annotation is the thing the signature
-// is a claim about rather than a second opinion the signature may overrule: meeting would
-// let a body stating `approx` silently become a `replay` demand, and healing would then
-// pin the fold the author had explicitly asked to leave free. No demand on the value
-// means the signature supplies one, carried on a node of its own; a demand that satisfies
-// the signature hands the value back untouched; a demand that does not is a body
-// promising less than it publishes, which is reported.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes node (int) which is the node the function returns.
@@ -171,17 +156,25 @@ int declare_return_promise(resolve_state_t *state, const int node, const func_t 
     return -1;
 }
 
+// declare_call_promise applies a callee's declared return lane at a call site, as a demand
+// on the value the inlined body returns.
+//
+// Takes state (resolve_state_t) which is the lowering in progress.
+// Takes node (int) which is the node the inlined body returns.
+// Takes function (func_t) which is the function called.
+// Returns the node the promise is carried on, or -1 after reporting a defect.
+int declare_call_promise(resolve_state_t *state, const int node, const func_t *function) {
+    int inner = node;
+    const lane_t stated = demand_carried_by(state->dag, node, &inner);
+    if (stated != LANE_NONE && lane_satisfies(stated, function->lane)) {
+        return node;
+    }
+    const span_t at = function->lane_span.line ? function->lane_span : function->span;
+    return wrap_demand(state, node, function->lane, at);
+}
+
 // bless_is_legal_here reports whether a waiver may be written on the binding that lowered
 // to `node`, reporting and failing when it may not.
-//
-// Two node kinds qualify, the two the grounding sweep seeds false: a `source()` leaf, and
-// the OP_OPAQUE wrapper over a call declared `ungrounded`. A checksum is refused on an
-// opaque call because `bless_checksum_holds` compares the recorded value against the
-// column a source loads, and behind a call there is no loaded column, so a receipt
-// nothing verifies would read stronger than the admitted promise the bare form states. A
-// second waiver on one leaf is refused because the field holds one promise: two names for
-// one source are two bindings and one node, so the later binding would silently replace a
-// receipt a run can check with a promise nothing verifies.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes node (int) which is the node the binding lowered to.
@@ -195,7 +188,7 @@ static int bless_is_legal_here(resolve_state_t *state, const int node, const bin
     const span_t where = binding->bless_span.line ? binding->bless_span : binding->span;
     if (target->bless != 0) {
         diagnostic_error(state->diagnostics, where,
-                         "this value already carries a @bless, and one waiver covers one leaf; a "
+                         "this value already carries a @bless, and one waiver covers one value; a "
                          "second promise about the same read of the world would replace the first, "
                          "so write the waiver once, on the binding that names the source");
         state->malformed = 1;
@@ -224,16 +217,19 @@ static int bless_is_legal_here(resolve_state_t *state, const int node, const bin
 #endif
 }
 
+// bless_target returns the node a waiver on a binding that lowered to `node` is written on.
+//
+// Takes state (resolve_state_t) which is the lowering in progress.
+// Takes node (int) which is the node the binding lowered to.
+static int bless_target(const resolve_state_t *state, const int node) {
+    const dagnode_t *at = dag_at_const(state->dag, node);
+    const int over_opaque = at->op == OP_DEMAND && !at->stated_by_binding
+                            && dag_at_const(state->dag, at->in[0])->op == OP_OPAQUE;
+    return over_opaque ? at->in[0] : node;
+}
+
 // lower_binding lowers one `name := expr` binding, applies any qualifier and waiver
 // written on it, and puts the name in scope.
-//
-// A qualifier on a binding is both a demand on the value it names and the ambient over
-// the whole right-hand side, because a demand covers the values that feed it; declaring
-// it on the result alone would lower every fold in the right-hand side free. The demand
-// is written with declare_demand_meet rather than if-unset, because the programmer wrote
-// it here and the stronger of two demands on one value is the one that holds. The waiver
-// is applied to the node the binding lowered to, where the graph can answer whether that
-// node is a leaf the program does not fix.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes binding (bind_t) which is the binding being resolved.
@@ -249,18 +245,20 @@ int lower_binding(resolve_state_t *state, const bind_t *binding) {
         return -1;
     }
     if (binding->bless != 0) {
-        if (!bless_is_legal_here(state, node, binding)) {
+        const int target = bless_target(state, node);
+        if (!bless_is_legal_here(state, target, binding)) {
             return -1;
         }
-        dag_at(state->dag, node)->bless = binding->bless;
+        dag_at(state->dag, target)->bless = binding->bless;
     }
     int named = node;
     if (binding->lane != LANE_NONE) {
-        named = declare_demand_meet(state, node, binding->lane,
-                                    binding->lane_span.line ? binding->lane_span : binding->span);
+        named = declare_demand(state, node, binding->lane,
+                               binding->lane_span.line ? binding->lane_span : binding->span);
         if (named < 0) {
             return -1;
         }
+        dag_at(state->dag, named)->stated_by_binding = 1;
     }
     return !scope_bind(state, binding->name, binding->name_length, named, binding->span)
            ? -1 : named;
@@ -386,8 +384,8 @@ static int lower_expr_kind(resolve_state_t *state, expr_t *expression) {
 // lower_expr lowers one expression, dispatching on its kind.
 //
 // An expression states no demand of its own, so there is no ambient to set here and none
-// to restore; the ambient is introduced in exactly one place, lower_binding, and descends
-// from there.
+// to restore; the ambient is introduced in one place, lower_binding, and descends from
+// there.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes expression (expr_t) which is the expression being lowered.
@@ -416,12 +414,6 @@ static func_t *find_entry_function(program_t *program, const char *entry, diagno
 
 // bind_entry_parameters appends one input node per declared parameter and puts each name
 // in scope.
-//
-// The nodes are appended rather than interned, because two parameters are two values
-// however alike their declarations look. Every node is built with dag_node_init and never
-// with `= {0}`: zeroing leaves `carried` at 0, which is a real node index rather than a
-// blank, so a zeroed parameter carries a phantom edge to node 0 and the entry function
-// reports a carried depth with no recurrence in it.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes function (func_t) which is the function being lowered.
@@ -483,6 +475,25 @@ static int lower_entry_bindings(resolve_state_t *state, const func_t *function) 
     return 1;
 }
 
+// returns_qualified_binding reports whether `function` returns a name bound in its own body
+// by a binding that writes a lane, the one case declare_return_promise compares.
+//
+// Takes function (func_t) which is the function being lowered.
+// Returns 1 when the result names such a binding, 0 otherwise.
+static int returns_qualified_binding(const func_t *function) {
+    const expr_t *result = function->result;
+    if (!result || result->kind != EX_IDENT) {
+        return 0;
+    }
+    for (int i = function->binding_count - 1; i >= 0; i--) {
+        const bind_t *binding = &function->bindings[i];
+        if (names_equal(binding->name, binding->name_length, result->name, result->name_length)) {
+            return binding->lane != LANE_NONE;
+        }
+    }
+    return 0;
+}
+
 // lower_one_function lowers `function`'s parameters, bindings and result into `out`, and
 // applies its return promise.
 //
@@ -498,7 +509,9 @@ static void lower_one_function(resolve_state_t *state, func_t *function, resolve
         out->status = RESOLVE_MALFORMED; return;
     }
     if (function->lane != LANE_NONE) {
-        out->result = declare_return_promise(state, out->result, function);
+        out->result = returns_qualified_binding(function)
+                          ? declare_return_promise(state, out->result, function)
+                          : declare_call_promise(state, out->result, function);
         if (out->result < 0) {
             out->status = RESOLVE_MALFORMED; return;
         }
@@ -517,23 +530,24 @@ static resolved_t resolve_declaration(program_t *program, func_t *function,
                                       diagnostic_t *diagnostics);
 
 // sweep_declaration heals and lane-checks one lowered declaration, so that what the
-// standalone pass verifies is the lane the body computes and not merely a lane it
-// happened to write down.
+// standalone pass verifies is the lane the body computes and not a lane it happened to
+// write down.
 //
-// declare_return_promise compares the signature against a demand declared syntactically,
-// so a body that computes `approx` without saying so declares nothing and the promise
-// holds only because there is nothing to check; the sweep computes what the body actually
-// reaches. A lane violation sets `rejected` and a body that never resolved does not,
-// because a lane verdict and a structural failure are different answers. An allocation
-// failure here reports and returns 0 with `rejected` left alone, because returning 1
-// would accept a body the checker had not looked at.
+// declare_return_promise compares the signature against a qualifier a binding of the body
+// writes, so a body that computes `approx` without saying so declares nothing and the
+// promise holds only because there is nothing to compare; the sweep computes what the body
+// reaches.
+// A sweep that produced no lanes sets `malformed` and a lane violation does not, because a
+// structural failure and a lane verdict are different answers. An allocation failure here
+// reports, sets `malformed` and returns 0, because returning 1 would accept a body the
+// checker had not looked at.
 //
 // Takes one (resolved_t) which is the lowered declaration.
 // Takes diagnostics (diagnostic_t) which is where a refusal is reported.
-// Takes rejected (int) which is set when the body violates a demand.
+// Takes malformed (int) which is set when the sweep produced no answer.
 // Takes found (check_result_t) which accumulates what the bodies here got wrong.
 // Returns 1 when the body checks, 0 when it does not.
-static int sweep_declaration(const resolved_t *one, diagnostic_t *diagnostics, int *rejected,
+static int sweep_declaration(const resolved_t *one, diagnostic_t *diagnostics, int *malformed,
                              check_result_t *found) {
     const int count = dag_count(one->dag);
     if (count <= 0) {
@@ -546,43 +560,40 @@ static int sweep_declaration(const resolved_t *one, diagnostic_t *diagnostics, i
         at.column = 1;
         at.length = 1;
         diagnostic_error(diagnostics, at,
-                   "out of memory while checking a declaration no call reaches");
+                   "out of memory while checking a declaration on its own");
+        *malformed = 1;
         return 0;
     }
     (void) heal_program(one->dag, one->result);
     const check_result_t swept = lattice_check(one->dag, one->result, computed, diagnostics);
     free(computed);
-    if (check_rejected(&swept)) {
-        *rejected = 1;
-        found->violations += swept.violations;
-        found->ungrounded += swept.ungrounded;
+    if (check_malformed(&swept)) {
+        *malformed = 1;
     }
+    found->violations += swept.violations;
+    found->ungrounded += swept.ungrounded;
     return !check_rejected(&swept) && !check_malformed(&swept);
 }
 
-// resolve_verify_declarations checks every function the entry path would not reach, so a
-// published return lane, and every demand written inside a body, is verified whether or
-// not anything calls it.
-//
-// Only the entry is skipped. A call to a declaration marked `ungrounded` lowers to an
-// opaque leaf, so its body is never inlined anywhere, and an uncalled helper is reached
-// by no lowering at all; verifying only the functions carrying a declared lane would
-// leave both checked by nothing.
+// resolve_verify_declarations checks every function other than the entry on a lowering of
+// its own, so a published return lane, and every demand written inside a body, is
+// verified whether or not anything calls it.
 //
 // Takes program (program_t) which is the parsed program.
 // Takes entry (char) which is the entry function's name.
 // Takes diagnostics (diagnostic_t) which is where a refusal is reported.
-// Takes rejected (int) which is set when a body violated a demand rather than failing to
-// resolve, so the caller reports a lane verdict rather than a structural one.
+// Takes malformed (int) which is set when a declaration failed to resolve or its sweep
+// produced no lanes, so the caller reports a structural answer, which outranks any lane
+// verdict another declaration earned.
 // Takes found (check_result_t) which receives what was wrong across every declaration
 // here. The pass checks all of them, so any number may fail, and the two kinds of refusal
 // are counted apart for the reason report_refusal in main.c gives.
 // Returns 1 when every declaration checks, 0 when one did not.
 int resolve_verify_declarations(program_t *program, const char *entry,
-                                    diagnostic_t *diagnostics, int *rejected,
+                                    diagnostic_t *diagnostics, int *malformed,
                                     check_result_t *found) {
     int ok = 1;
-    *rejected = 0;
+    *malformed = 0;
     *found = check_result_none();
     for (int i = 0; i < program->function_count; i++) {
         func_t *function = &program->functions[i];
@@ -591,8 +602,10 @@ int resolve_verify_declarations(program_t *program, const char *entry,
             continue;
         }
         const resolved_t one = resolve_declaration(program, function, diagnostics);
-        if (one.status != RESOLVE_OK
-            || !sweep_declaration(&one, diagnostics, rejected, found)) {
+        if (one.status != RESOLVE_OK) {
+            *malformed = 1;
+            ok = 0;
+        } else if (!sweep_declaration(&one, diagnostics, malformed, found)) {
             ok = 0;
         }
         dag_free(one.dag);
@@ -636,6 +649,13 @@ resolved_t resolve_program(program_t *program, const char *entry, diagnostic_t *
     if (!function) {
         out.status = RESOLVE_MALFORMED; return out;
     }
+    if (function->parameter_count > 0) {
+        diagnostic_error(diagnostics, function->parameters[0].span,
+                         "'%s' is the entry and nothing calls it, so no argument would fix this "
+                         "parameter; read the data with source(), and bless it if a demand "
+                         "covers it", entry);
+        out.status = RESOLVE_MALFORMED; return out;
+    }
     lower_one_function(&state, function, &out);
     return out;
 }
@@ -647,7 +667,7 @@ resolved_t resolve_program(program_t *program, const char *entry, diagnostic_t *
 // pass a declared function no call reaches would never be lowered and could promise
 // anything. Parameters become leaves because what a parameter holds is the caller's
 // obligation, and from inside the callee it is grounded by assumption; the lowering asks
-// the one question the signature is a claim about, and asks it of the body alone.
+// the question the signature is a claim about, and asks it of the body alone.
 //
 // Takes program (program_t) which is the parsed program.
 // Takes function (func_t) which is the declaration to lower.

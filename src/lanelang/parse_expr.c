@@ -60,7 +60,7 @@ static void parse_argument_label(parser_t *parser, arg_t *argument) {
 }
 
 // parse_lambda parses a step function, defined below and forward-declared here because
-// the argument list is what reaches it.
+// the argument list calls it.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static expr_t *parse_lambda(parser_t *parser);
@@ -68,11 +68,11 @@ static expr_t *parse_lambda(parser_t *parser);
 // parse_argument_value reads one argument's value: a step function after a `with:` label,
 // and an ordinary expression after every other.
 //
-// `with:` is the one label a step function may follow, so `(acc, t) => e` is parsed here
-// and nowhere else, and the same text in any other position is a syntax error by
-// construction. That keeps a step out of the value grammar: no production reaches it, so
-// it cannot be bound, returned or put in a column. A `with:` written on a call with no
-// use for one is refused when that call is lowered, which is where the callee is known.
+// A step function may follow only a `with:` label, so `(acc, t) => e` is parsed here and
+// nowhere else, and the same text in any other position is a syntax error. That keeps a
+// step out of the value grammar: no production reaches it, so it cannot be bound,
+// returned or put in a column. A `with:` written on a call with no use for one is refused
+// when that call is lowered, because the callee is known there.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes argument (arg_t) which is the argument whose label has been read.
@@ -176,10 +176,10 @@ static expr_t *parse_identifier_or_call(parser_t *parser, const span_t span) {
 // parse_step_parameter reads one of a step function's parameter names into the three
 // fields that describe it.
 //
-// A qualifier here is refused rather than ignored. Both parameters are bound by the
-// recurrence, the first to the carried value, whose lane is the recurrence's, and the
-// second to a tick index that is a function of the program. Neither has a lane of its own
-// to state, so a qualifier written here could only be dropped silently.
+// A qualifier here is refused. Both parameters are bound by the recurrence, the first to
+// the carried value, whose lane is the recurrence's, and the second to a tick index that
+// is a function of the program. Neither has a lane of its own to state, so a qualifier
+// written here could only be dropped silently.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes name (char) which receives the start of the name in the source.
@@ -213,8 +213,8 @@ static int parse_step_parameter(parser_t *parser, const char **name, int *length
 // braced body of bindings ending in `return`.
 //
 // A block body is an ordinary body, read by the same parse_bindings a function body uses,
-// so `replay part := sum(x)` inside a step means exactly what it means outside one and
-// the waiver is available in both. The expression form is the same body with no bindings.
+// so `replay part := sum(x)` inside a step means what it means outside one and the waiver
+// is available in both. The expression form is the same body with no bindings.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes step (lambda_t) which receives the body.
@@ -244,8 +244,8 @@ static int parse_step_body(parser_t *parser, lambda_t *step) {
 
 // parse_lambda parses a step function, `(acc, t) => e` or `(acc, t) => { ... return e }`.
 //
-// The arity is exactly two and the refusals say so: one parameter has no tick index to
-// advance by and three has no protocol at all, so neither is accepted with a silent
+// The arity is fixed at two and the refusals say so: one parameter has no tick index to
+// advance by and three has no protocol, so neither is accepted with a silent
 // reinterpretation. A step that does not need its tick index still writes one and ignores
 // it, which costs nothing, because the index is lowered on first reference and a body
 // that never names it mints no node. The two names must also differ, because both are
@@ -350,8 +350,8 @@ static expr_t *parse_primary(parser_t *parser) {
 //
 // The two cases get different messages because they are different mistakes. A lane word
 // after the `@` gets a refusal naming the two spellings that work, because somebody who
-// writes it knows exactly what they meant. Anything else is a misspelling or an
-// invention, and there is nothing to suggest.
+// writes it knows what they meant. Anything else is a misspelling or an invention, and
+// there is nothing to suggest.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Returns 0, always, so parse_bless can report and return in one expression.
@@ -379,13 +379,13 @@ static long long refuse_unknown_at_word(parser_t *parser) {
 //
 // It is not an arm of parse_qualifiers, which reads lane demands: kept apart, an `@bless`
 // where a lane belongs reaches the unknown-annotation path, a lane where a waiver belongs
-// is simply not a waiver, and neither reader needs a rule about the other. The checksum
-// is range-checked before it is converted, and both halves matter: a fractional one
-// truncates, so `@bless(3.5)` would vouch for checksum 3, and one past what a `long long`
-// holds is undefined behaviour on the conversion itself (C11 6.3.1.4). The bound is
-// UINT_MAX because eval_bless_checksum returns `unsigned`, so anything above it could
-// never match. The argument is a bare number: parse_argument_label discards labels, so a
-// labelled form here would accept `@bless(banana: a + b)`.
+// is not a waiver, and neither reader needs a rule about the other. The checksum is
+// range-checked before it is converted, for two reasons: a fractional one truncates, so
+// `@bless(3.5)` would vouch for checksum 3, and one past what a `long long` holds is
+// undefined behaviour on the conversion itself (C11 6.3.1.4). The bound is UINT_MAX
+// because eval_bless_checksum returns `unsigned`, so anything above it could never match.
+// The argument is a bare number: parse_argument_label discards labels, so a labelled form
+// here would accept `@bless(banana: a + b)`.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Returns 0 for absent, BLESS_PROMISE for the bare form, or a checksum biased by one.
@@ -445,9 +445,8 @@ static int refuse_bless_on_factor(parser_t *parser, const expr_t *node) {
 //
 // A lane cannot be written here. A lane is a fact about a value, so it is written where a
 // value is named; an expression names nothing, so there is no lane to read at this
-// position. The waiver remains, and is refused here for its own reason: it belongs to the
-// binding that names the value, which is where one promise covers one leaf by
-// construction.
+// position. A waiver is read here and refused for its own reason: it belongs to the
+// binding that names the value, where one promise covers one leaf by construction.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Returns the factor, or NULL after reporting a defect.
@@ -548,9 +547,9 @@ static expr_t *parse_expr_inner(parser_t *parser) {
 // a check inside parse_expr_inner, so that the decrement cannot be missed on an
 // early-return path.
 //
-// What it bounds: the cycle expr -> term -> factor -> primary -> "(" expr ")" passes
-// through here once per nested parenthesis, so one counter bounds nesting by parentheses
-// and by call arguments.
+// The cycle expr -> term -> factor -> primary -> "(" expr ")" passes through here once
+// per nested parenthesis, so one counter bounds nesting by parentheses and by call
+// arguments.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 expr_t *parse_expr(parser_t *parser) {

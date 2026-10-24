@@ -152,10 +152,10 @@ static int dag_contract_equal(const dagnode_t *a, const dagnode_t *b) {
 //
 // The carried edge is not compared, because nothing carrying one reaches here: dag_intern
 // passes OP_RECUR straight through, so an interning candidate always has `carried` at -1.
-// `tick_of` is compared and is load-bearing, because two tick nodes share an op, an
-// operand count, a class and a lane, and dag_arithmetic_equal compares labels only for
-// constants and generators, so `tick_of` is the whole of what separates an inner
-// recurrence's counter from an outer one's.
+// `tick_of` is compared, and must be, because two tick nodes share an op, an operand
+// count, a class and a lane, and dag_arithmetic_equal compares labels only for constants
+// and generators, so `tick_of` alone separates an inner recurrence's counter from an outer
+// one's.
 //
 // Takes a (dagnode_t) which is the first value.
 // Takes b (dagnode_t) which is the second value.
@@ -222,7 +222,7 @@ const dagnode_t *dag_at_const(const dag_t *g, const int i) {
 }
 
 // dag_clear_use_counts forgets every use count and reachability mark, so a recount starts
-// from nothing.
+// from zero.
 //
 // Takes g (dag_t) which is the graph being walked.
 static void dag_clear_use_counts(dag_t *g) {
@@ -266,8 +266,8 @@ static int dag_mark_producers_of(dag_t *g, const int index) {
 // already passed, and that body's own producers would never be reached. The sweep
 // therefore repeats until nothing new is marked. Without this a producer reachable only
 // through a carried edge stays outside the demanded cone, is never counted as used, and
-// can never be healed, which silently costs every recurrence the inference that every
-// other construct gets.
+// can never be healed, so recurrences would silently miss the inference that other
+// constructs get.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
@@ -310,13 +310,13 @@ static void dag_count_uses_from_reached(dag_t *g) {
 
 // dag_recount_uses counts over the nodes that reach the result and no others.
 //
-// Healing reads this count for one thing only: whether a consumer is live, and heal.c
-// skips a dead one on `uses == 0`. resolve.c lowers every binding in source order whether
-// or not it reaches the result, so counting over the whole array would give a dead
-// binding a non-zero count and let it decide a verdict, which is dead-code elimination
-// changing what a program means. The carried edge is a use like any other, and is
-// counted: a recurrence really does read its body. Privacy is decided by heal.c's
-// mark_escapes, never by this count.
+// Healing reads this count only to decide whether a consumer is live, and heal.c skips a
+// dead one on `uses == 0`. resolve.c lowers every binding in source order whether or not
+// it reaches the result, so counting over the whole array would give a dead binding a
+// non-zero count and let it decide a verdict, which is dead-code elimination changing
+// what a program means. The carried edge is a use like any other, and is counted: a
+// recurrence reads its body. Privacy is decided by heal.c's mark_escapes, never by this
+// count.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
@@ -381,8 +381,8 @@ static void dag_node_text(const dagnode_t *node, char *text, const size_t capaci
 }
 
 // dag_dot_label builds the Graphviz label for one node. `with_lanes` adds the node's
-// schedule class and any demand stated on it, which is what a figure of a checked program
-// shows.
+// schedule class and any demand stated on it; a figure of a checked program uses that
+// form.
 //
 // Takes node (dagnode_t) which is the node under examination.
 // Takes with_lanes (int) which selects the lane-annotated form.
@@ -416,7 +416,8 @@ static int dag_node_is_blamed(const int *blame, const int blame_count, const int
 }
 
 // dag_edge_is_blamed reports whether the edge from `from` to `to` is a step along the
-// blame path, which is what makes an arrow bold rather than merely its endpoints.
+// blame path. An arrow is drawn bold for such a step, not whenever both its endpoints are
+// blamed.
 //
 // Takes blame (int) which is the blame path, for highlighting.
 // Takes blame_count (int) which is how many nodes the blame path holds.

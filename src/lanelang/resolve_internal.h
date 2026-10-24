@@ -26,7 +26,7 @@
 #define SCOPE_CAPACITY 128
 
 // MAX_INLINE_DEPTH is how many calls deep inlining may go; reaching it is reported as a
-// call nesting error, which is how recursion is refused before it exhausts the C stack.
+// call nesting error, so recursion is refused before it exhausts the C stack.
 #define MAX_INLINE_DEPTH 32
 
 // MAX_INLINED_CALLS is how many call sites one lowering may inline, a bound on work
@@ -36,8 +36,8 @@
 #define MAX_INLINED_CALLS 200000L
 
 // CHOOSE_ARGUMENT_COUNT is how many operands choose() takes: the mask and the two arms.
-// The arity check and the node's input count are the same number by construction, which
-// is what keeps a fourth operand from being read out of an array sized for three.
+// The arity check and the node's input count are the same number by construction, so a
+// fourth operand cannot be read out of an array sized for three.
 #define CHOOSE_ARGUMENT_COUNT 3
 
 // CONST_LABEL is the label a literal node carries, a literal having no source name of its
@@ -132,17 +132,17 @@ static int names_equal(const char *left, const int left_length, const char *righ
 int scope_bind(resolve_state_t *state, const char *name, const int name_length, const int node,
                const span_t at);
 
-// declare_demand_meet applies a demand the programmer wrote directly on a value, taking
-// the meet of it and any demand already carried there, and returns the node that carries
-// the result.
+// declare_demand applies a demand the programmer wrote directly on a value, nesting it
+// over any demand of another lane already carried there, and returns the node that
+// carries it.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes node (int) which is the value the demand is about.
 // Takes demand (lane_t) which is the demand written.
 // Takes at (span_t) which is where it was written.
 // Returns the demand node's index, or -1 after reporting a defect.
-int declare_demand_meet(resolve_state_t *state, const int node, const lane_t demand,
-                        const span_t at);
+int declare_demand(resolve_state_t *state, const int node, const lane_t demand,
+                   const span_t at);
 
 // declare_return_promise applies a callee's declared return lane to the value it returns,
 // carrying it on a node of its own, and reports a body that promises less than its
@@ -153,6 +153,16 @@ int declare_demand_meet(resolve_state_t *state, const int node, const lane_t dem
 // Takes function (func_t) which is the function whose signature this is.
 // Returns the node the promise is carried on, or -1 after reporting a weaker body.
 int declare_return_promise(resolve_state_t *state, const int node, const func_t *function);
+
+// declare_call_promise applies a callee's declared return lane at a call site, as a demand
+// on the value its inlined body returns, nested over any lane that value states which does
+// not satisfy it.
+//
+// Takes state (resolve_state_t) which is the lowering in progress.
+// Takes node (int) which is the node the inlined body returns.
+// Takes function (func_t) which is the function called.
+// Returns the node the promise is carried on, or -1 after reporting a defect.
+int declare_call_promise(resolve_state_t *state, const int node, const func_t *function);
 
 // intern_or_report interns a node, reporting an allocation failure.
 //

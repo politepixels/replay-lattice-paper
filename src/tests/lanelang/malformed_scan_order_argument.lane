@@ -15,7 +15,7 @@
 package app
 
 // EXPECT: malformed
-// EXPECT-DIAGNOSTIC: a scan lowers to the fixed-block form whatever the dial says
+// EXPECT-DIAGNOSTIC: there is no oracle-order scan kernel
 func main() Float {
     x := indices(count: 8.0)
     s := scan(x, order: oracle)

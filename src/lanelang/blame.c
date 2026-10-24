@@ -66,8 +66,8 @@ static int skip_demands(const dag_t *g, const int node) {
 // entry of `in`, but blame walks the same edges the join travelled and the join does
 // travel this one, and omitting it makes a recurrence blame itself, the walk finding no
 // bad operand and reporting a node whose own class is the join identity. Taking it last
-// keeps a genuine forward operand preferred, so the reported path is the shorter one
-// where both exist.
+// keeps a forward operand preferred, so the reported path is the shorter one where both
+// exist.
 //
 // Takes node (dagnode_t) which is the node under examination.
 // Takes k (int) which is the edge to return, counting from zero.
