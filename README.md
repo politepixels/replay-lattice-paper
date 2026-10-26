@@ -17,8 +17,8 @@ works, nothing more.
 
 ```sh
 git clone https://github.com/politepixels/replay-lattice-paper && cd replay-lattice-paper
-./reproduce.sh          # every receipt; Coq and CCCL checks SKIP cleanly where absent
-./controls.sh           # the must-fail controls: proof the checks can fail
+make reproduce         # every receipt; Coq and CCCL checks SKIP cleanly where absent
+make controls          # the must-fail controls: proof the checks can fail
 ```
 
 `reproduce.sh` prints one line per check and a final tally that **names its skips**. On a machine with Coq and a CUDA compiler with the CCCL headers, every check runs and the tally ends `ALL CHECKS GREEN`, with nothing skipped. On a box without them those checks still appear in the tally, each named as a skip.
@@ -28,9 +28,35 @@ A check that cannot run reports `SKIP`, never `PASS`. `--expect-skips=` takes th
 ## Try the checker on one program
 
 ```sh
-make -C src/lanelang all
+make lanelang FILE=src/tests/lanelang/reject_poison.lane
+```
+
+This command builds the checker if needed, then prints the blame diagnostic *The Replay Lattice* quotes: the site that states the demand, the producer upstream where the guarantee was actually lost, and the distance between them. Swap in any fixture from `src/tests/lanelang/` to see an acceptance, a healing or a different rejection, or write your own `.lane` file.
+`./build/bin/test_lanelang src/tests/lanelang` runs all of them and prints one verdict per fixture.
+
+Use `ACTION=lower` or `ACTION=dot` with `make lanelang` for the other checker modes.
+The binary remains available directly for scripts, for example:
+
+```sh
 ./build/bin/lanelang check src/tests/lanelang/reject_poison.lane
 ```
 
-The second command prints the blame diagnostic *The Replay Lattice* quotes: the site that states the demand, the producer upstream where the guarantee was actually lost, and the distance between them. Swap in any fixture from `src/tests/lanelang/` to see an acceptance, a healing or a different rejection, or write your own `.lane` file.  
-`./build/bin/test_lanelang src/tests/lanelang` runs all of them and prints one verdict per fixture.
+The rejection example intentionally exits with a failure status; Make reports that exit too.
+
+## Root Make targets
+
+Plain `make` builds the checker and test tools. `make help` lists the available targets.
+`make test` runs the fixtures, `make reproduce` runs the complete evaluation, and
+`make controls` runs the deliberately broken implementations. `make clean` removes build outputs.
+
+The fuzz target accepts a mode, sample count and seed:
+
+```sh
+make fuzz MODE=roundtrip COUNT=2000 SEED=1
+make fuzz MODE=agree COUNT=2000 SEED=1
+make fuzz MODE=metamorphic COUNT=2000 SEED=1
+```
+
+The defaults are `MODE=roundtrip`, `COUNT=2000` and `SEED=20260725`. Very small samples can
+fail coverage requirements even when their lane comparisons agree. The fuzzer reports results,
+not the generated source text.

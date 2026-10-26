@@ -19,9 +19,9 @@ keywords:
   - type systems
   - parallel reduction
 license: Apache-2.0
-version: 0.3.0
-date-released: 2026-10-24
-doi: 10.5281/zenodo.23617974
+version: 0.4.0
+date-released: 2026-10-26
+doi: 10.5281/zenodo.23655048
 preferred-citation:
   type: article
   title: "The Replay Lattice: A Type System for Floating-Point Reproducibility"
