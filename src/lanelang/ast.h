@@ -37,9 +37,8 @@ typedef enum {
     // EX_BINOP is a binary operation, whose operands are `left` and `right`.
     EX_BINOP,
 
-    // EX_LAMBDA is a step function written inline, `(acc, t) => e`, whose payload is in
-    // `lambda`. It is not a value: the parser admits it only as the value of a `with:`
-    // label, so one cannot be bound, returned or put in a column.
+    // EX_LAMBDA holds an inline step function such as `(acc, t) => e` in `lambda`. The
+    // grammar admits a step only as a `with:` argument.
     EX_LAMBDA
 } expr_kind_t;
 
@@ -52,8 +51,7 @@ typedef struct {
     // is positional.
     const char *label;
 
-    // label_length is how many bytes of `label` belong to the label. Zero when the
-    // argument is positional.
+    // label_length counts the bytes in the label and is zero for a positional argument.
     int label_length;
 
     // value is the argument's value.
@@ -64,13 +62,14 @@ typedef struct {
 // defined below, after the bindings it holds.
 typedef struct lambda lambda_t;
 
-// expr is one expression node. Which of the payload fields carry meaning is decided by
-// `kind`; the rest are zero, because every node is cleared when it is allocated.
+// expr is one expression node. Its kind selects the active payload fields. The arena
+// clears the remaining fields on allocation.
 struct expr {
     // kind is which of the payloads below this node uses.
     expr_kind_t kind;
 
-    // span is the source text this node was parsed from.
+    // span locates the token used for diagnostics. A call uses its name and a binary
+    // operation uses its operator.
     span_t span;
 
     // number is the literal's value, for EX_NUMBER.
@@ -123,25 +122,21 @@ typedef struct {
     // lane_span is the qualifier's source text, for blame.
     span_t lane_span;
 
-    // bless is the waiver written on this binding: 0 when not blessed, BLESS_PROMISE when
-    // blessed with nothing to check, and `c + 1` when blessed with checksum `c`. The bias
-    // moves absent onto zero, because 0 is a checksum a real column can have, and a
-    // zeroed node therefore arrives unblessed from a memset. A binding holds one value,
-    // so a waiver written here covers one leaf and cannot be made to cover two.
+    // bless records the waiver on this binding. Zero means no waiver, BLESS_PROMISE means
+    // a bare waiver, and `c + 1` records checksum `c`. The bias distinguishes an absent
+    // waiver from a checksum of zero. Each waiver covers the value of one binding.
     long long bless;
 
-    // bless_span is the waiver's source text, for blame.
+    // bless_span locates the waiver's opening `@` for diagnostics.
     span_t bless_span;
 } bind_t;
 
 // lambda is a step function, held behind a pointer so that an ordinary expression node
 // does not carry a step's worth of unused fields.
 //
-// The arity is fixed at two and the second parameter is the tick index. A step that
-// ignores its tick index costs nothing, because `t` is lowered on first reference and a
-// body that never names it mints no node. A block body, `(acc, t) => { ... return e }`,
-// holds the same bindings a function body holds, so a binding inside a step means what it
-// means outside one; an expression body is the same thing with no bindings.
+// A step has two parameters. The second is the tick index, and the resolver emits a tick
+// node only if the body reads it. A block body, `(acc, t) => { ... return e }`, holds
+// bindings in the same order as a function body. An expression body has no bindings.
 struct lambda {
     // carry_name is the start of the first parameter's name in the source, which the
     // recurrence's carried value is bound to.
@@ -190,17 +185,16 @@ typedef struct {
     span_t span;
 
     // lane is the demand this parameter states on whatever the caller passes, or
-    // LANE_NONE. The callee states what it needs, and the caller's value is checked
-    // against it where the caller wrote it.
+    // LANE_NONE. The checker applies the demand to the argument at each call.
     lane_t lane;
 
-    // lane_span is where that demand appears in the source, for the diagnostic's second
-    // span.
+    // lane_span locates the qualifier in the signature. A violation reports the demand
+    // here.
     span_t lane_span;
 } parameter_t;
 
-// func_t is one declared function. There is no separate body node: a body is bindings
-// then a result.
+// func_t represents a function declaration. The body consists of its bindings followed by
+// the result expression.
 typedef struct {
     // name is the start of the function name in the source.
     const char *name;
@@ -211,10 +205,9 @@ typedef struct {
     // span is the source text of the function name, for diagnostics.
     span_t span;
 
-    // lane is the qualifier written in the return type, or LANE_NONE when the declaration
-    // writes none. It is a promise about what the function returns, not an ambient over
-    // its body: it descends nowhere, the body's folds still lower free, and the lane is
-    // then compared against what the body computes.
+    // lane is the return qualifier, or LANE_NONE if the declaration omits it. The checker
+    // compares this promise with the computed result lane. The return qualifier does not
+    // set the ambient lane for the body.
     lane_t lane;
 
     // lane_span is the source text of the qualifier that set `lane`, so a violation
@@ -227,10 +220,9 @@ typedef struct {
     // parameter_count is how many entries `parameters` has.
     int parameter_count;
 
-    // ungrounded is whether the declaration says the checker cannot see how the result
-    // was made. It is a qualifier independent of `lane`, because grounding is one bit
-    // conjoined over inputs while a lane is a join over a chain, and nothing combines
-    // them. It is written before the lane and nowhere else.
+    // ungrounded records whether the declaration reserves the right to depend on external
+    // inputs. The grounding sweep treats this separately from the lane join. When the
+    // declaration gives both qualifiers, `ungrounded` appears first.
     int ungrounded;
 
     // bindings is the bindings in the body, in the order they were written.

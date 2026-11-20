@@ -18,22 +18,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-// DAG_INITIAL_CAPACITY is how many nodes a fresh graph makes room for. Growth doubles
-// from here, so the value only trades one early reallocation against the memory a tiny
-// program holds.
+// DAG_INITIAL_CAPACITY is the number of slots allocated on the first append. Later growth
+// doubles the capacity.
 #define DAG_INITIAL_CAPACITY 64
 
-// DAG_DOT_LABEL_MAX is the longest Graphviz node label built. A label that would exceed
-// it is truncated by snprintf, which costs a figure some text and can never overrun the
-// buffer.
+// DAG_DOT_LABEL_MAX is the capacity in bytes of the node label buffer, including the
+// terminating null. snprintf truncates longer labels.
 #define DAG_DOT_LABEL_MAX 256
 
-// DAG_DOT_TEXT_MAX is the longest node description built for a Graphviz label, which is a
-// binding name and one word. Truncation has the same consequence as for the label itself.
+// DAG_DOT_TEXT_MAX is the capacity in bytes of the buffer for a node's name and
+// operation, including the terminating null.
 #define DAG_DOT_TEXT_MAX 160
 
-// dag is a growable array of nodes, kept in dependency order: every operand is appended
-// before the node that reads it.
+// dag is a growable array of nodes in dependency order. Each operand precedes the node
+// that reads it.
 struct dag {
     // nodes is the nodes, or NULL before the first append.
     dagnode_t *nodes;
@@ -80,8 +78,8 @@ static int dag_grow(dag_t *g) {
     return 1;
 }
 
-// dag_append appends a copy of `node`: the result is its index, or -1 when the array
-// cannot grow.
+// dag_append appends a copy of `node` and returns its index, or -1 if the array cannot
+// grow.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes node (dagnode_t) which is the node under examination.
@@ -93,12 +91,11 @@ int dag_append(dag_t *g, const dagnode_t *node) {
     return g->count++;
 }
 
-// dag_arithmetic_equal reports whether two nodes agree on the arithmetic they perform:
-// the literal or element count they carry, the elementwise operator they apply, and the
-// name a literal was given.
+// dag_arithmetic_equal compares constants and generator lengths with their labels, and
+// compares the operator for an elementwise node.
 //
-// The constants are compared by bit pattern: == would merge -0.0 with +0.0, which an
-// executor can tell apart, and would keep two identical NaN constants distinct.
+// Comparing the bits preserves the sign of zero and lets identical NaN bit patterns share
+// a node. Numeric equality loses the sign and treats even identical NaNs as unequal.
 //
 // Takes a (dagnode_t) which is the first value.
 // Takes b (dagnode_t) which is the second value.
@@ -122,9 +119,8 @@ static int dag_arithmetic_equal(const dagnode_t *a, const dagnode_t *b) {
     return 1;
 }
 
-// dag_contract_equal reports whether two nodes agree on their determinism contract: the
-// lane each was built under, the demand stated on it, the schedule class its lowering
-// will use, and the promise scope it was built inside.
+// dag_contract_equal compares the construction lane, the stated demand and whether a
+// binding supplied it, the schedule class and the enclosing promise scope.
 //
 // Takes a (dagnode_t) which is the first value.
 // Takes b (dagnode_t) which is the second value.
@@ -137,7 +133,7 @@ static int dag_contract_equal(const dagnode_t *a, const dagnode_t *b) {
     if (a->lane != b->lane) {
         return 0;
     }
-    if (a->declared != b->declared) {
+    if (a->declared != b->declared || a->stated_by_binding != b->stated_by_binding) {
         return 0;
     }
     if (a->promise != b->promise) {
@@ -147,15 +143,12 @@ static int dag_contract_equal(const dagnode_t *a, const dagnode_t *b) {
 #endif
 }
 
-// dag_nodes_equal is structural equality for the interning: the operation, the operands,
-// the determinism contract and the arithmetic.
+// dag_nodes_equal checks whether the operation, operands, determinism contract and
+// arithmetic allow two nodes to share an entry.
 //
-// The carried edge is not compared, because nothing carrying one reaches here: dag_intern
-// passes OP_RECUR straight through, so an interning candidate always has `carried` at -1.
-// `tick_of` is compared, and must be, because two tick nodes share an op, an operand
-// count, a class and a lane, and dag_arithmetic_equal compares labels only for constants
-// and generators, so `tick_of` alone separates an inner recurrence's counter from an outer
-// one's.
+// dag_intern appends each OP_RECUR directly, so candidates here have no carried edge to
+// compare. Tick nodes have no operands. Their `tick_of` fields distinguish an inner
+// counter from an outer one.
 //
 // Takes a (dagnode_t) which is the first value.
 // Takes b (dagnode_t) which is the second value.
@@ -174,22 +167,31 @@ static int dag_nodes_equal(const dagnode_t *a, const dagnode_t *b) {
     return !dag_contract_equal(a, b) ? 0 : dag_arithmetic_equal(a, b);
 }
 
-// dag_intern interns a node, and passes leaves straight through: two parameters are two
-// values however alike they look.
+// dag_intern reuses an equivalent node when it is safe to share. Each input parameter
+// gets its own node.
 //
-// OP_RECUR also goes straight through, because its body is built after it, so its carried
-// edge is still -1 when it is added, and interning would merge two recurrences on a field
-// neither has filled in yet. OP_SOURCE never interns because two source() calls are two
-// values: nothing says the world hands back the same column twice. OP_OPAQUE never
-// interns because `bless` is outside the interning key, and an opaque wrapper handed to a
-// second owner would carry a promise nobody wrote about that owner's value.
+// A new OP_RECUR has no carried edge until its body is built. A new OP_SOURCE may receive
+// different data on each call. Each OP_OPAQUE also needs its own node because its owner's
+// `bless` promise lies outside the interning key.
+//
+// A recurrence node holds the incoming carry inside its step and the final result after
+// the step closes. An expression that reads the final result can only share a node built
+// after the step.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes node (dagnode_t) which is the node under examination.
 int dag_intern(dag_t *g, const dagnode_t *node) {
     if (node->op != OP_INPUT && node->op != OP_SOURCE && node->op != OP_RECUR
         && node->op != OP_OPAQUE) {
-        for (int i = 0; i < g->count; i++) {
+        int first = 0;
+        for (int k = 0; k < node->input_count; k++) {
+            const int input = node->in[k];
+            if (input >= 0 && input < g->count && g->nodes[input].op == OP_RECUR
+                && g->nodes[input].step_end >= first) {
+                first = g->nodes[input].step_end + 1;
+            }
+        }
+        for (int i = first; i < g->count; i++) {
             if (dag_nodes_equal(&g->nodes[i], node)) {
                 return i;
             }
@@ -232,6 +234,25 @@ static void dag_clear_use_counts(dag_t *g) {
     }
 }
 
+// dag_mark_cone marks a node and its transitive inputs, following carried edges too.
+//
+// Takes g (dag_t) which is the graph being walked.
+// Takes at (int) which is the node whose inputs to mark.
+// Takes cone (char) which holds one mark per node, initially zero for an empty cone.
+void dag_mark_cone(const dag_t *g, const int at, char *cone) {
+    if (at < 0 || at >= g->count || cone[at]) {
+        return;
+    }
+    cone[at] = 1;
+    const dagnode_t *node = dag_at_const(g, at);
+    for (int k = 0; k < node->input_count; k++) {
+        dag_mark_cone(g, node->in[k], cone);
+    }
+    if (node->carried >= 0) {
+        dag_mark_cone(g, node->carried, cone);
+    }
+}
+
 // dag_mark_producers_of marks every node that feeds node `index`, and reports whether
 // that changed anything.
 //
@@ -261,13 +282,9 @@ static int dag_mark_producers_of(dag_t *g, const int index) {
 // dag_mark_nodes_reaching_result marks every node that reaches `result`, working
 // backwards from it.
 //
-// A carried edge points forward, from a recurrence to a body built after it, so one
-// backward sweep does not suffice: marking the recurrence would mark a body the sweep has
-// already passed, and that body's own producers would never be reached. The sweep
-// therefore repeats until nothing new is marked. Without this a producer reachable only
-// through a carried edge stays outside the demanded cone, is never counted as used, and
-// can never be healed, so recurrences would silently miss the inference that other
-// constructs get.
+// A carried edge can lead from a recurrence to a body built later. By the time the
+// backward sweep marks that body it may already have passed its producers. Repeating the
+// sweep until the marks settle includes those producers in the use counts for healing.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
@@ -310,13 +327,10 @@ static void dag_count_uses_from_reached(dag_t *g) {
 
 // dag_recount_uses counts over the nodes that reach the result and no others.
 //
-// Healing reads this count only to decide whether a consumer is live, and heal.c skips a
-// dead one on `uses == 0`. resolve.c lowers every binding in source order whether or not
-// it reaches the result, so counting over the whole array would give a dead binding a
-// non-zero count and let it decide a verdict, which is dead-code elimination changing
-// what a program means. The carried edge is a use like any other, and is counted: a
-// recurrence reads its body. Privacy is decided by heal.c's mark_escapes, never by this
-// count.
+// Healing uses these counts to identify live consumers. A binding outside the result's
+// dependencies supplies no live read, even though the resolver lowered it. Each
+// recurrence counts a read of its step result through the carried edge. The caller counts
+// as a reader of the program's result. The separate escape walk decides privacy.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
@@ -329,10 +343,8 @@ void dag_recount_uses(dag_t *g, const int result) {
     }
 }
 
-// dag_lane_fill is the Graphviz fill colour for a lane: green for the strongest
-// guarantee, blue for a pinned tree, red for a free reduction, grey for anything else.
-// The hex values are byte-compared against the committed figures, so they are contract
-// text.
+// dag_lane_fill chooses green for `exact`, blue for `replay`, red for `approx` and grey
+// for an unstated lane.
 //
 // Takes lane (lane_t) which is the lane to report.
 static const char *dag_lane_fill(const lane_t lane) {
@@ -344,14 +356,11 @@ static const char *dag_lane_fill(const lane_t lane) {
     }
 }
 
-// dag_node_text describes a node for a figure: its binding name where it has one, then
-// one word for what it computes. The words are byte-compared against the committed
-// figures, so they are contract text.
+// dag_node_text describes a node with its label, if any, followed by the name of its
+// operation.
 //
-// Every op is named and there is no `default`, so -Wswitch under the build's -Werror
-// makes the next op added fail to compile here rather than draw itself as a fold. A
-// `default` answering "fold" would hand every later op that word, and no committed figure
-// holds such a node, so no figure comparison could catch it.
+// Every op is named. Omitting a default lets -Wswitch under the build's -Werror catch an
+// operation missing from this switch.
 //
 // Takes node (dagnode_t) which is the node under examination.
 // Takes text (char) which receives the description's bytes.
@@ -380,9 +389,8 @@ static void dag_node_text(const dagnode_t *node, char *text, const size_t capaci
     }
 }
 
-// dag_dot_label builds the Graphviz label for one node. `with_lanes` adds the node's
-// schedule class and any demand stated on it; a figure of a checked program uses that
-// form.
+// dag_dot_label builds the Graphviz label for one node. A figure of a checked program
+// sets `with_lanes` to include the schedule class and any stated demand.
 //
 // Takes node (dagnode_t) which is the node under examination.
 // Takes with_lanes (int) which selects the lane-annotated form.
@@ -434,9 +442,8 @@ static int dag_edge_is_blamed(const int *blame, const int blame_count, const int
 
 // dag_write_carried_edge draws node `index`'s carried edge, if it has one, dashed.
 //
-// The carried edge is the single cycle the language admits and the reason lattice_check
-// has an iterative branch, so a figure that omitted it would show a graph that settles in
-// one pass. It is dashed rather than solid because it runs backwards in the node order.
+// The dashed line connects the step result to the recurrence that reads it. When the body
+// depends on the carry, this edge closes a cycle that the lane sweep must settle.
 //
 // Takes file (FILE) which is the stream being written.
 // Takes g (dag_t) which is the graph being drawn.
@@ -454,9 +461,8 @@ static void dag_write_carried_edge(FILE *file, const dag_t *g, const int index,
             carried, index, hot ? " penwidth=3 color=\"#b03030\"" : "");
 }
 
-// dag_dot_preamble writes the graph attributes every figure shares: left-to-right
-// ranking, which fits a two-column page, and the node and edge styles. The attribute
-// order is byte-compared against the committed figures.
+// dag_dot_preamble writes the shared node and edge styles and sets a left-to-right
+// layout.
 //
 // Takes file (FILE) which is the stream being written.
 static void dag_dot_preamble(FILE *file) {

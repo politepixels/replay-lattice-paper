@@ -14,11 +14,13 @@
 
 package app
 
-// EXPECT: reject computed=approx demanded=replay primary=22:5 secondary=20:20 hops=2
+// EXPECT: reject computed=approx demanded=replay primary=24:5 secondary=20:17 hops=3
 func main() Float {
-    x := indices(count: 100000.0)
-    approx gate := sum(x * 0.5)
-    chosen := choose(when: gate, then: x * 2.0, else: x * 0.5)
-    replay total := sum(chosen)
+    x := indices(count: 339.0)
+    approx s := sum(x * 0.5)
+    picked := choose(when: s - 1.3078970368951559e-05,
+                     then: x * 0.0 + 3.0,
+                     else: x * 0.0 + 5.0)
+    replay total := isum(picked)
     return total
 }

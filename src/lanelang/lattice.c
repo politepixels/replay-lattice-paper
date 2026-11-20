@@ -65,8 +65,7 @@ static int any_input_tainted(const dagnode_t *node, const int index, const char 
     return 0;
 }
 
-// report_violation reports one violation: the demand that was not met, and the operation
-// that lost the guarantee.
+// report_violation reports the unmet demand and the operation that lost the guarantee.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes computed (lane_t) which holds the lane computed for each node.
@@ -80,21 +79,22 @@ static void report_violation(
     const lane_t lane,
     diagnostic_t *d
 ) {
-    int blame[BLAME_PATH_MAX];
-    const int blame_length = lattice_blame(g, computed, index, lane, blame, BLAME_PATH_MAX);
+    const int count = dag_count(g);
+    int *blame = malloc((size_t) count * sizeof *blame);
+    const int blame_length = blame ? lattice_blame(g, computed, index, lane, blame, count) : -1;
     const int introducer = blame_length > 0 ? blame[0] : index;
     const int hops = blame_length > 0 ? blame_length - 1 : 0;
-    const int truncated = blame_length < 0;
+    free(blame);
 
     const dagnode_t *node = dag_at_const(g, index);
     const dagnode_t *source = dag_at_const(g, introducer);
     const span_t primary = node->declared_span.line ? node->declared_span : node->span;
     const span_t secondary = source->span;
 
-    if (truncated) {
+    if (blame_length < 0) {
         diagnostic_error(d, primary, "determinism lane violation: this value computes %s where %s "
-                   "is demanded, by a path longer than the %d nodes this checker walks",
-                   lane_name(lane), lane_name(node->declared), BLAME_PATH_MAX);
+                   "is demanded (out of memory tracing its origin)",
+                   lane_name(lane), lane_name(node->declared));
         return;
     }
     diagnostic_error_with_cause(d, primary, secondary, hops,
@@ -107,16 +107,19 @@ static void report_violation(
                   source->label_length, source->label, opclass_name(source->op_class),
                   lane_name(opclass_lane(source->op_class)));
     }
+    if (node->argument_span.line) {
+        diagnostic_note(d, node->argument_span, "the argument is passed to the demanding "
+                  "parameter here");
+    }
 }
 
 // leaf_is_grounded reports whether a leaf's value is a function of the program rather
 // than of the world.
 //
-// A literal and a generated column are fixed by the program, and a parameter is the
-// caller's obligation, so it is grounded by assumption from inside the callee; the entry,
-// which has no caller, may not declare one. OP_SOURCE
-// reaches out for a value nobody fixed, so it is the only leaf that may not carry a
-// demand without a waiver; a call declared `ungrounded` is not a leaf and is decided in
+// Literals and generated columns are fixed by the program. A callee assumes its
+// parameters are grounded because their values are the caller's obligation. The entry has
+// no caller and cannot declare a parameter. An external source needs a waiver to support
+// an `exact` or `replay` demand. Opaque calls have an input and are handled by
 // ground_of_node.
 //
 // Takes node (dagnode_t) which is the node under examination.
@@ -124,21 +127,21 @@ static int leaf_is_grounded(const dagnode_t *node) {
     return node->op != OP_SOURCE;
 }
 
-// GROUND_FIXED marks a node the program itself fixes: both bits, because anything the
-// program fixes is also something a declaration may rest on.
+// GROUND_FIXED sets both bits for a value the program fixes. A declaration may rely on
+// that value.
 #define GROUND_FIXED 3
 
-// GROUND_BLESSED marks a node a declaration may rest on although the program does not fix
-// it: the waived bit alone. A blessed source settles here and never at GROUND_FIXED.
+// GROUND_BLESSED sets the waiver bit alone. A declaration may rely on a blessed source
+// even though the program does not fix its value.
 #ifdef LANELANG_BLESS_FLIPS_GROUNDED
 #define GROUND_BLESSED 3
 #else
 #define GROUND_BLESSED 2
 #endif
 
-// opaque_seed is what a node contributes to its own grounding before its inputs are
-// conjoined: GROUND_FIXED for ordinary work, and for a call declared `ungrounded`, the
-// waiver it carries and nothing else.
+// opaque_seed supplies the grounding bits to conjoin with a node's inputs. Ordinary
+// operations start with GROUND_FIXED. An opaque call contributes only its own waiver, if
+// present.
 //
 // An opaque call loses the fact and keeps the conjunction. Its author declared the value
 // not a function of the program, so bit 0 goes whatever the body says, and dropping the
@@ -165,11 +168,9 @@ static char opaque_seed(const dagnode_t *node) {
 // ground_of_node returns node `index`'s grounding given what the sweep believes of its
 // inputs.
 //
-// A leaf states its own grounding and everything else conjoins its inputs' bits, so a
-// cone loses the fact as soon as one input lacks it, while a waiver survives only where
-// every input carries one. The carried edge is a read like any other, because a
-// recurrence whose body reaches a source is not grounded, and omitting that edge would
-// hide it.
+// A leaf states its own grounding. Other nodes conjoin the bits of their inputs,
+// including the carried edge of a recurrence. For a demand to rely on the result, every
+// input must be fixed or covered by a waiver. An opaque call also needs its own waiver.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -199,20 +200,15 @@ static char ground_of_node(const dag_t *g, const int count, const char *grounded
 
 // ground_pass fills `grounded` for every node, two bits each.
 //
-// Bit 0 is the fact, the program fixes this value; bit 1 is the policy, a declaration
-// over this value may be accepted. Both propagate as a conjunction over every read and
-// differ only in what a leaf contributes; GROUND_FIXED has bit 1 set, so fixed implies
-// acceptable by arithmetic, and the value 1 is unreachable. A bless must not make a value
-// grounded: it makes a declaration acceptable while the value goes on reporting that the
-// program does not fix it. The seed is the top, because the carried edge may point
-// forward, so a recurrence reads a node the sweep has not visited, and seeding at
-// not-grounded would make every recurrence ungrounded by accident of visit order.
-// Settling is reported rather than assumed, because falling out of the loop at the bound
-// is otherwise indistinguishable from settling.
+// Bit 0 records whether the program fixes the value. Bit 1 records whether a declaration
+// may rely on it. A fixed value sets both bits. A blessed source or an opaque call can
+// carry just bit 1. The sweep conjoins the bits across reads, starting from both bits set
+// so a forward carried edge can retain grounding until a dependency takes it away. A
+// final pass with no change confirms the result has settled.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Returns 1 when it settled, 0 when the passes ran out with a bit still moving.
 static int ground_pass(const dag_t *g, const int count, char *grounded) {
     for (int i = 0; i < count; i++) {
@@ -237,12 +233,9 @@ static int ground_pass(const dag_t *g, const int count, char *grounded) {
 // report_over_declared_opaque notes every `ungrounded` call whose body the checker can
 // see is grounded.
 //
-// Over-declaring is legal, because a library author may reserve the right to reach the
-// world later without breaking callers, and forcing the answer false can only refuse more
-// programs; the note changes no verdict and names the reservation where it is written.
-// The test against GROUND_FIXED is an equality and not a mask, because a body holding a
-// blessed source carries the waiver bit alone and only a body the program itself fixes is
-// an over-declaration.
+// A library author may declare a grounded body `ungrounded` to reserve the right to read
+// external data later. The checker honours the declaration and adds a note at the call.
+// Testing for GROUND_FIXED excludes bodies that rely on a waiver.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -267,21 +260,17 @@ static void report_over_declared_opaque(const dag_t *g, const int count,
     }
 }
 
-// first_ungrounded_leaf_seen is the first ungrounded leaf reachable from `from`, or
-// `from` itself when no leaf beneath it is ungrounded, or -1 when `from` is grounded,
-// already visited, or out of range.
-//
-// It walks operands depth-first and stops at the first ungrounded leaf, which is where
-// the value entered the program and where a reader can act. `seen` is a cycle guard
-// rather than an optimisation, because the carried edge may point forward, so a
-// recurrence whose body names the binding it defines would recurse until the stack ran
-// out.
+// first_ungrounded_leaf_seen finds the origin of an ungrounded value. It searches the
+// operands before the carried edge and skips nodes already visited, so a cycle leaves
+// other branches open. An unwaived opaque call is itself the origin if its body yields
+// none.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Takes from (int) which is where the run begins.
 // Takes seen (char) which marks the nodes already visited.
+// Returns the origin's node index, or -1 if this branch supplies none.
 static int first_ungrounded_leaf_seen(
     const dag_t *g, const int count, const char *grounded, const int from, char *seen
 ) {
@@ -305,20 +294,18 @@ static int first_ungrounded_leaf_seen(
             return found;
         }
     }
-    return from;
+    return node->op == OP_OPAQUE && !node->bless ? from : -1;
 }
 
-// first_ungrounded_leaf is the node a refused declaration's diagnostic names: the first
-// ungrounded leaf its cone reaches, or the start node itself when no leaf beneath it is
-// ungrounded. -1 means the start node is grounded. On allocation failure it degrades to
-// naming the start node.
+// first_ungrounded_leaf finds the origin named by a grounding refusal. On allocation
+// failure it falls back to the node where the search would start.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Takes from (int) which is the node to start from.
 static int first_ungrounded_leaf(const dag_t *g, const int count, const char *grounded, const int from) {
-    char *seen = (char *) calloc((size_t) (count > 0 ? count : 1), 1);
+    char *seen = (char *) calloc(count > 0 ? (size_t) count : 1, 1);
     if (!seen) {
         return from;
     }
@@ -327,19 +314,16 @@ static int first_ungrounded_leaf(const dag_t *g, const int count, const char *gr
     return found;
 }
 
-// report_ungrounded reports a declaration refused because its cone reaches a leaf the
-// program does not fix.
+// report_ungrounded reports a declaration whose cone reaches an unwaived source or opaque
+// call.
 //
-// It does not use the two-span lane-violation shape, because no guarantee was ever
-// available to lose, and a lost-guarantee reading invites the repair that does not work,
-// which is pinning a producer; a source is ungrounded whatever qualifier it carries. The
-// advice names the waiver that will be accepted: a source loads a column, so a checksum
-// has something to be verified against, while a call declared `ungrounded` loads none and
-// only the bare form is legal on it.
+// Pinning a producer cannot fix its inputs. The diagnostic points to the unfixed source
+// or opaque call and names the waiver that applies there. A source loads bytes that a
+// checksum can verify. An opaque call accepts the bare waiver.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Takes index (int) which is the node's index in the graph.
 // Takes d (diagnostic_t) which is where diagnostics are collected.
 static void report_ungrounded(
@@ -369,6 +353,10 @@ static void report_ungrounded(
                       : "'%.*s' is a leaf this program does not fix, so its value is not a "
                         "function of the program",
                   source->label_length, source->label);
+    }
+    if (node->argument_span.line) {
+        diagnostic_note(d, node->argument_span, "the argument is passed to the demanding "
+                  "parameter here");
     }
 }
 
@@ -505,9 +493,8 @@ static int dag_carried_depth(const dag_t *g, const int count) {
 // lane_pass computes every node's lane by one forward pass, returning non-zero when a
 // lane moved.
 //
-// The carried edge is joined here and nowhere else. It is read from `computed` rather
-// than from `in`, so join_input_lanes never sees an index it would have to refuse, and
-// the sweep's strictly-earlier precondition stays true.
+// A carried edge may point forward, so its lane comes from the latest value in
+// `computed`. Ordinary operands must precede their consumer.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -542,21 +529,19 @@ static int lane_pass(const dag_t *g, const int count, lane_t *computed, int *mal
 // declaration_is_ungrounded reports whether a declaration demands more than its cone can
 // ground.
 //
-// Grounding is checked before the lane, and separately from it. A demand for `exact` or
-// `replay` is a claim that rerunning this artefact reproduces these bits, and a cone that
-// reaches an external source cannot honour it however well pinned its folds are; `approx`
-// demands nothing of the schedule and so demands nothing here either. The substitute
-// below replaces the whole predicate rather than an `#ifdef` inside one condition.
+// Grounding is checked before the lane. An `exact` or `replay` declaration requires its
+// external inputs to be vouched for even when the fold order is pinned. An `approx`
+// declaration needs no grounding guarantee.
 //
 // Takes node (dagnode_t) which is the node under examination.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Takes index (int) which is the node's index in the graph.
 #ifdef LANELANG_NO_GROUNDING
 // declaration_is_ungrounded always answers no, which drops the grounding judgement from
 // this build.
 //
 // Takes node (dagnode_t) which is the node under examination.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Takes index (int) which is the node's index in the graph.
 static int declaration_is_ungrounded(const dagnode_t *node, const char *grounded, const int index) {
     (void) node; (void) grounded; (void) index;
@@ -566,7 +551,7 @@ static int declaration_is_ungrounded(const dagnode_t *node, const char *grounded
 // declaration_is_ungrounded is the shipped judgement.
 //
 // Takes node (dagnode_t) which is the node under examination.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Takes index (int) which is the node's index in the graph.
 static int declaration_is_ungrounded(const dagnode_t *node, const char *grounded, const int index) {
     return grounded && !grounded[index] && node->declared != LANE_APPROX;
@@ -602,11 +587,9 @@ typedef struct {
 // check_one_declaration checks node `index` against the demand declared on it, recording
 // the verdict and reporting it unless it is a consequence of one already reported.
 //
-// A node with no declaration is still visited, because the cascade is a property of the
-// graph rather than of the declarations, so a value between two declarations carries the
-// taint of the one that failed. Grounding is asked first and separately: a declaration
-// over a value the program does not fix is refused whatever lane the sweep computed,
-// because that lane is a statement about a value the checker cannot see the making of.
+// A node with no declaration can still carry an upstream failure to an ordinary consumer.
+// The grounding check runs first. An `exact` or `replay` declaration is refused when its
+// cone lacks both grounding and an effective waiver, whatever lane the sweep computed.
 //
 // Takes check (declaration_check_t) which is the context the whole sweep shares.
 // Takes index (int) which is the node being checked.
@@ -663,7 +646,7 @@ static void check_one_declaration(const declaration_check_t *check, const int in
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
 // Takes computed (lane_t) which holds the lane computed for each node.
-// Takes grounded (char) which marks the nodes whose value the program fixes.
+// Takes grounded (char) which records which values are fixed and which a demand may use.
 // Takes d (diagnostic_t) which is where diagnostics are collected.
 // Takes outcome (check_result_t) which receives what the check found.
 static void check_declarations(
@@ -680,7 +663,7 @@ static void check_declarations(
         .computed = computed,
         .grounded = grounded,
         .d = d,
-        .tainted = (char *) calloc((size_t) (count > 0 ? count : 1), 1),
+        .tainted = (char *) calloc(count > 0 ? (size_t) count : 1, 1),
         .outcome = outcome,
     };
 
@@ -691,15 +674,14 @@ static void check_declarations(
     free(check.tainted);
 }
 
-// report_malformed_sweep renders the refusal for a sweep that would not run, blaming the
-// node it stopped at.
+// report_malformed_sweep reports why checking could not finish. Invalid edges use the
+// consumer's span. Other failures use the first node's span when one exists.
 //
-// It does not use the lane-violation shape, because the failure is a property of the
-// graph and not of a path through it, so there is no cause span to walk to.
+// An incomplete sweep has no lane verdict or blame path.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
-// Takes outcome (check_result_t) which receives what the check found.
+// Takes outcome (check_result_t) which identifies the failure to report.
 // Takes d (diagnostic_t) which is where diagnostics are collected.
 static void report_malformed_sweep(
     const dag_t *g, const int count, const check_result_t *outcome, diagnostic_t *d
@@ -804,15 +786,10 @@ static int count_ungrounded_nodes(const char *grounded, const int count) {
 //
 // The sweep seeds at the join identity, because a carried edge is read before the node it
 // points at has been visited, and starting at the identity makes the iteration climb
-// towards the least fixed point. The ceiling is the loosest provable bound,
-// count * (LANE_CHAIN_HEIGHT - 1) + 1 passes, looser than the tight bound the fixture
-// check asserts, so a regression in the measurement stays a loud failure there rather
-// than a wrong answer here. Exhaustion is recorded as a malformed graph and reported,
-// because a refusal must not render as an acceptance. The grounding sweep runs to its own
-// fixed point for the same reason, and failing to allocate its scratch buffer refuses
-// rather than continuing, because passing NULL through to check_declarations would skip
-// the grounding judgement for every declaration and then report the result as though it
-// had run.
+// towards the least fixed point. A graph with `count` nodes permits at most count *
+// (LANE_CHAIN_HEIGHT - 1) lane increases. One additional pass confirms convergence. The
+// fixture check tests the tighter carried-depth bound. Failure to settle, or to allocate
+// the grounding workspace, stops the check before it can issue a verdict.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
@@ -836,7 +813,7 @@ check_result_t lattice_check(dag_t *g, const int result, lane_t *computed, diagn
         return outcome;
     }
 
-    char *grounded = (char *) calloc((size_t) (count > 0 ? count : 1), 1);
+    char *grounded = (char *) calloc(count > 0 ? (size_t) count : 1, 1);
     if (!grounded) {
         outcome.malformed = 0;
         outcome.malformed_reason = MALFORMED_OUT_OF_MEMORY;

@@ -23,13 +23,13 @@
 // Takes node (dagnode_t) which is the node under examination.
 const char *lower_kernel_for(const dagnode_t *node);
 
-// lower_kernel_demand_free_cases checks that kernel selection ignores the demand, and
-// returns the number of (class, demand, ambient) triples checked, or 0 when a build lets
-// the demand reach the discharge.
+// lower_kernel_demand_free_cases checks that varying the demand and ambient lane leaves
+// kernel selection unchanged for each class. It returns the number of triples checked, or
+// zero on a mismatch.
 int lower_kernel_demand_free_cases(void);
 
-// lower_print prints one line per kernel-bearing node in `g`: the node, its source name,
-// and the kernel it lowers to.
+// lower_print prints one line for each kernel-bearing node in `g`, giving the node index,
+// its label and the selected kernel. An unlabelled node uses "sum".
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes stream (void) which is where the output is written.

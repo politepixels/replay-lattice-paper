@@ -25,16 +25,16 @@ typedef enum {
     // build.
     LANE_EXACT  = 1,
 
-    // LANE_REPLAY is the value was computed under a fixed tree whose shape depends on the
-    // input shape alone.
+    // LANE_REPLAY guarantees the same bits across schedules for fixed data and shape
+    // under the fixed build.
     LANE_REPLAY = 2,
 
-    // LANE_APPROX is no constraint: the bits may move with the schedule.
+    // LANE_APPROX permits the result bits to vary with the schedule.
     LANE_APPROX = 3
 } lane_t;
 
-// LANE_CHAIN_HEIGHT is how many elements the chain has, so a computed lane can climb at
-// most LANE_CHAIN_HEIGHT - 1 times; LANE_NONE is not on the chain and is not counted.
+// LANE_CHAIN_HEIGHT counts the elements of the lane chain. A computed lane can climb at
+// most LANE_CHAIN_HEIGHT - 1 times. LANE_NONE represents an absent demand.
 #define LANE_CHAIN_HEIGHT 3
 
 // lane_join is the join of two lanes, which is the weaker of the pair.
@@ -61,8 +61,7 @@ static inline int lane_satisfies(const lane_t have, const lane_t want) {
 //
 // Takes lane (lane_t) which is the lane to report.
 //
-// Returns a string literal owned by this function. It is byte-compared by the fixture
-// runner and by the committed figures, so its spelling is contract text.
+// Returns a string literal used in diagnostics and graph labels.
 static inline const char *lane_name(const lane_t lane) {
     switch (lane) {
     case LANE_EXACT:  return "exact";
@@ -84,22 +83,20 @@ typedef enum {
     // all reduction parallelism.
     OPC_FOLD_EXACT,
 
-    // OPC_FOLD_INTEGER is an exact-integer fold, which preserves the input join at no
-    // parallelism cost, because integer addition below 2^53 is `exact` in double and so
-    // associative there, and the operation enforces its own domain.
+    // OPC_FOLD_INTEGER permits regrouping within its checked domain. Integral inputs
+    // whose absolute values sum to less than 2^53 give the serial result in any grouping.
     OPC_FOLD_INTEGER,
 
     // OPC_FOLD_REPLAY is a fixed-tree fold, which caps the result at LANE_REPLAY, and
     // whose leaf blocks a parallel backend may fold concurrently.
     OPC_FOLD_REPLAY,
 
-    // OPC_FOLD_APPROX is a free reduction, which reassociates as the deployment pleases,
-    // so its result is schedule-dependent whatever it was given.
+    // OPC_FOLD_APPROX permits a free reduction to reassociate its inputs. The result bits
+    // may vary with the schedule.
     OPC_FOLD_APPROX,
 
-    // OPC_SCAN_REPLAY is a fixed-block scan, whose blocks write disjoint output ranges
-    // and whose offset pass runs serially whatever the worker count, so the bits are a
-    // function of (data, shape) alone.
+    // OPC_SCAN_REPLAY scans fixed-width blocks and advances the base in block order for
+    // every worker count.
     OPC_SCAN_REPLAY,
 
     // OPC_SCAN_APPROX is a free scan, which chunks by worker count, so the partial
@@ -107,35 +104,33 @@ typedef enum {
     OPC_SCAN_APPROX
 } opclass_t;
 
-// bitsdep_t is what a kernel's output bits are a function of, the question each row of the
-// op-class table answers.
+// bitsdep_t describes what determines a kernel's output bits.
 typedef enum {
-    // BITS_NEUTRAL is the kernel performs no reassociable combination of its own, so
-    // whatever agreement its operands had, its result keeps. It is a closure property,
-    // not a claim about a source, and a leaf has no operands for it to be about.
+    // BITS_NEUTRAL means the operation introduces no reassociation, so its result
+    // preserves the agreement of its operands. Grounding separately describes a source's
+    // dependence on the input world.
     BITS_NEUTRAL,
 
-    // BITS_DATA_AND_REFERENCE is the bits are a function of the data alone, and equal the
-    // serial reference oracle's result under the fixed build. Order-independence alone
-    // does not earn `exact`, because a correctly-rounded sum is order-free and is not the
-    // serial fold's answer.
+    // BITS_DATA_AND_REFERENCE means the result agrees with the serial reference under the
+    // fixed build. An order-independent kernel can still differ from that reference, as a
+    // correctly rounded sum can differ from a serial fold.
     BITS_DATA_AND_REFERENCE,
 
-    // BITS_DATA_AND_SHAPE is the bits are a function of (data, shape) alone: never of the
-    // worker count, the launch geometry, or whatever shares the batch.
+    // BITS_DATA_AND_SHAPE means that only (data, shape) determines the result bits. The
+    // worker count, launch geometry and other members of a batch cannot change them.
     BITS_DATA_AND_SHAPE,
 
-    // BITS_SCHEDULE is the bits move with the schedule.
+    // BITS_SCHEDULE allows the result bits to vary with the schedule.
     BITS_SCHEDULE
 } bitsdep_t;
 
 // bitsdep_lane is the lane a kernel whose bits depend on `dependency` contributes to the
 // join.
 //
-// The rule is `replay` iff the bits are a function of (data, shape) alone, `exact` iff
-// additionally equal to the serial reference, and `approx` otherwise. BITS_NEUTRAL
-// contributes LANE_EXACT, the join identity, because a neutral operation introduces no
-// divergence of its own and so cannot weaken what it is given.
+// A kernel with a fixed result for its data and shape contributes LANE_REPLAY. Agreement
+// with the serial reference strengthens this to LANE_EXACT. A kernel whose contract
+// permits schedule dependence contributes LANE_APPROX. BITS_NEUTRAL contributes the join
+// identity because the operation introduces no divergence of its own.
 //
 // Takes dependency (bitsdep_t) which is what the kernel's bits depend on.
 static inline lane_t bitsdep_lane(const bitsdep_t dependency) {
@@ -150,9 +145,8 @@ static inline lane_t bitsdep_lane(const bitsdep_t dependency) {
 
 // opclass_bits is what the bits of an operation of class `op_class` are a function of.
 //
-// This is the table itself: one row per kernel, and nothing else in the language decides
-// a class. Arms that repeat an earlier answer are deliberate and stay separate, because
-// the repetition shows that the class follows from what the bits depend on.
+// Each kernel class has its own row, including classes with the same dependency. This
+// makes each class's contribution to the join explicit.
 //
 // Takes op_class (opclass_t) which is the schedule class the kernel carries.
 static inline bitsdep_t opclass_bits(const opclass_t op_class) {
@@ -176,12 +170,12 @@ static inline lane_t opclass_lane(const opclass_t op_class) {
     return bitsdep_lane(opclass_bits(op_class));
 }
 
-// opclass_name is the printed name of `op_class`, as the dump and the figures show it.
+// opclass_name gives the printed name of a schedule class for diagnostics and graph
+// labels.
 //
 // Takes op_class (opclass_t) which is the schedule class the kernel carries.
 //
-// Returns a string literal owned by this function. The committed figures are
-// byte-compared against it, so its spelling is contract text.
+// Returns a string literal owned by this function.
 static inline const char *opclass_name(const opclass_t op_class) {
     switch (op_class) {
     case OPC_FOLD_APPROX:  return "fold/free";
@@ -195,15 +189,14 @@ static inline const char *opclass_name(const opclass_t op_class) {
     return "neutral";
 }
 
-// BLESS_PROMISE is what a `@bless` carrying no checksum stores, negative because a
-// checksum plus one is always positive, so a single comparison separates the promise from
-// the receipt and `> 0` is the test for "there is something to verify". It flips no
-// verdict: a blessed leaf is still ungrounded, and the bless is consulted only where a
-// declaration is accepted or refused.
+// BLESS_PROMISE encodes a bare `@bless` as a negative value. A positive value represents
+// a checksum biased by one, so `> 0` is the test for "there is something to verify". The
+// grounding sweep tracks the waiver separately from the lane.
 #define BLESS_PROMISE (-1)
 
-// LANELANG_KILL_ENV is the environment variable that disables the declaration check, so
-// the checker's cost and its verdicts can be compared against a build without it.
+// LANELANG_KILL_ENV names the switch that lets `check`, `lower` and `dot` ignore
+// declaration verdicts when set to "1". Standalone structural checks still run. The `run`
+// command always enforces declaration verdicts.
 #define LANELANG_KILL_ENV "LANELANG_NOCHECK"
 
 #endif  // LANELANG_LANE_H

@@ -14,36 +14,18 @@
 
 #include "oracle.h"
 
-// walk_t is one enumeration in progress.
 typedef struct {
-    // graph is the graph being walked, borrowed from the caller.
     const dag_t *graph;
 
-    // cap is the largest number of complete paths the walk may take before it gives up.
     long cap;
 
-    // paths is how many complete paths have been walked so far.
     long paths;
 
-    // worst is the weakest lane seen across the complete paths so far, seeded with
-    // LANE_EXACT, the join identity.
     lane_t worst;
 
-    // overflow is non-zero once `cap` was exceeded, after which no answer is claimed.
     int overflow;
 } walk_t;
 
-// oracle_walk walks backwards from node `at`, carrying in `accumulator` the weakest
-// schedule class seen so far on this path.
-//
-// Every complete path, meaning one that reaches a node with no inputs, contributes its
-// accumulated weakest class, and the answer is the weakest across all of them. The walk
-// memoises nothing and shares no state between paths, so its agreement with the sweep
-// stays evidence rather than the same algorithm answering twice.
-//
-// Takes state (walk_t) which is the enumeration in progress.
-// Takes at (int) which is the node to start from.
-// Takes accumulator (lane_t) which is the running fold value.
 static void oracle_walk(walk_t *state, const int at, const lane_t accumulator) {
     if (state->overflow) {
         return;
@@ -71,13 +53,6 @@ static void oracle_walk(walk_t *state, const int at, const lane_t accumulator) {
     }
 }
 
-// oracle_lane is the weakest schedule class on any complete path backwards from `node`,
-// or LANE_NONE when the node is out of range or the enumeration exceeds `cap` paths.
-//
-// Takes g (dag_t) which is the graph being walked.
-// Takes node (int) which is the node under examination.
-// Takes cap (long) which bounds how much work the walk may do.
-// Takes paths_out (long) which receives how many complete paths were walked.
 lane_t oracle_lane(const dag_t *g, const int node, const long cap, long *paths_out) {
     walk_t state;
     state.graph = g;

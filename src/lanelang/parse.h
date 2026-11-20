@@ -18,9 +18,18 @@
 #include "ast.h"
 #include "diagnostic.h"
 
+// parse_read_source reads the complete text of a source file.
+//
+// Takes path (char) which names the source file.
+// Takes nul_byte (size_t) which receives the one-based offset of an embedded NUL, or
+// zero.
+// Returns a NUL-terminated buffer owned by the caller, or NULL if reading fails or the
+// file contains a NUL byte.
+char *parse_read_source(const char *path, size_t *nul_byte);
+
 // parse_program parses `source`, whose name is `file`, reporting through `diagnostics`.
-// Returns NULL on any syntax error, having reported at least one. The returned program
-// borrows `source`, which must outlive it; release it with ast_free.
+// Returns NULL on a parse or allocation failure. The returned program borrows the source
+// text and file name. Both must outlive it. Release the program with ast_free.
 //
 // Takes file (char) which is the file being read.
 // Takes source (char) which is the source text, borrowed.

@@ -23,10 +23,9 @@ cd "$(dirname "$0")/.." || exit 1
 # deliberately broken copy without touching the shipped one.
 PROOF_DIR="${RL_PROOF_DIR:-src/proofs}"
 
-# The complete list of parameters the mechanised results may rest on: five of the sibling
-# development's eight, and the two primitive float operations the reassociation witness
-# evaluates. Anything beyond it fails the audit.
-EXPECTED_AXIOMS="Gated add bits eqb eval schedule world"
+# The model uses five parameters from the core development along with Coq's primitive
+# float type, addition and equality test. The audit checks this set exactly.
+EXPECTED_AXIOMS="Gated add bits eqb eval float schedule world"
 
 # The scratch directory holding the build and audit logs, removed on a trap.
 WORK=""
@@ -61,32 +60,34 @@ require_coq() {
     command -v coqc >/dev/null 2>&1 || say SKIP 0 1 no-coq
 }
 
-# compile_developments compiles the abstract development and then the evaluator
-# development on top of it, failing the gate at the first that does not build.
+# compile_developments builds the lattice, evaluator and recurrence files in dependency order.
 # Globals:
 #   WORK - Read
 # Outputs:
 #   The indented build log on stderr when compilation fails
 compile_developments() {
+    local proof
     if ! coqc -Q . "" ReplayLattice.v >"$WORK/build.log" 2>&1; then
         sed 's/^/    /' "$WORK/build.log" >&2
         say FAIL 0 0 sibling-does-not-compile
     fi
-    if ! coqc -Q . "" ReplayLatticeEval.v >>"$WORK/build.log" 2>&1; then
-        sed 's/^/    /' "$WORK/build.log" >&2
-        say FAIL 0 0 proof-does-not-compile
-    fi
+    for proof in ReplayLatticeEval.v ScalarRecurrence.v; do
+        if ! coqc -Q . "" "$proof" >>"$WORK/build.log" 2>&1; then
+            sed 's/^/    /' "$WORK/build.log" >&2
+            say FAIL 0 0 proof-does-not-compile
+        fi
+    done
 }
 
-# write_assumptions_query writes the audit script: one Print Assumptions per row of the
-# operation-class table, plus the witnesses that the model can tell schedules apart at
-# all and that the fixed tree is not the serial reference, listed deliberately because
-# invariance rows with no way to fail assert nothing.
+# write_assumptions_query asks Coq for the assumptions of the operation-class results,
+# the schedule witnesses and the binary64 evaluator result. It also covers agreement
+# at each scalar recurrence step and the nested examples.
 # Globals:
 #   WORK - Read
 write_assumptions_query() {
     cat >"$WORK/assumptions.v" <<'EOF'
 Require Import ReplayLatticeEval.
+Require ScalarRecurrence.
 Print Assumptions row_fixed_tree_reduction.
 Print Assumptions row_data_movement.
 Print Assumptions row_carried_recurrence.
@@ -109,6 +110,12 @@ Print Assumptions witness_fixed_tree_is_not_reference.
 Print Assumptions demo_prog_wf.
 Print Assumptions demo_assumption1.
 Print Assumptions mgated_separates.
+Print Assumptions binary64_assumption1_on_dags.
+Print Assumptions ScalarRecurrence.run_ticks_agree.
+Print Assumptions ScalarRecurrence.result_agrees.
+Print Assumptions ScalarRecurrence.carried_agreement.
+Print Assumptions ScalarRecurrence.nested_constant.
+Print Assumptions ScalarRecurrence.nested_increment.
 EOF
 }
 
@@ -143,8 +150,7 @@ check_axiom_set() {
                          n = split($1, parts, "."); print parts[n]
                      }' "$WORK/assumptions.log" | sort -u | tr '\n' ' ')"
     observed="${observed% }"
-    # shellcheck disable=SC2086
-    expected="$(printf '%s\n' $EXPECTED_AXIOMS | sort -u | tr '\n' ' ')"
+    expected="$(tr ' ' '\n' <<< "$EXPECTED_AXIOMS" | sort -u | tr '\n' ' ')"
     expected="${expected% }"
     if [ "$observed" != "$expected" ]; then
         printf '    expected axioms: %s\n    observed axioms: %s\n' "$expected" "$observed" >&2
@@ -153,24 +159,23 @@ check_axiom_set() {
     cases=$((cases + 1))
 }
 
-# check_axiom_free_count asserts, as an equality rather than a floor, how many audited
-# results rest on nothing at all; raise the number in the same edit that closes a result.
+# check_axiom_free_count checks the exact number of audited results that are axiom-free.
 # Globals:
 #   WORK - Read
 #   cases - Incremented when the assertion holds
 # Outputs:
-#   The observed count on stderr when it is not exactly 20
+#   The observed count on stderr when it differs from the expected count
 check_axiom_free_count() {
     local closed_count
     closed_count="$(grep -c '^Closed under the global context' "$WORK/assumptions.log")"
-    if [ "$closed_count" -ne 20 ]; then
-        printf '    expected exactly 20 axiom-free results, saw %s\n' "$closed_count" >&2
+    if [ "$closed_count" -ne 21 ]; then
+        printf '    expected exactly 21 axiom-free results, saw %s\n' "$closed_count" >&2
         say FAIL "$cases" 0 rows-not-axiom-free
     fi
     cases=$((cases + 1))
 }
 
-# main runs the audit in order: build both developments, query, then the two assertions.
+# main builds the proof files, runs the query and checks both assertions.
 # Globals:
 #   WORK - Set
 #   PROOF_DIR - Read

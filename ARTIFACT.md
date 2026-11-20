@@ -2,20 +2,21 @@
 
 _Every claim in the paper, the command that reproduces it, and what you should see._
 
-Run everything at once with `./reproduce.sh` and `./controls.sh`. Together they take about a minute
-on a laptop; a machine with `coqc` takes longer. This file exists so an individual claim can be
-checked without reading the harness.
+Run the numbered checks with `./reproduce.sh` and the must-fail controls with `./controls.sh`.
+Run `make check-iris` for §5.5's concurrent sum proof. It checks that every terminating
+interleaving returns the fixed-tree result and that each input admits a terminating schedule
+for any positive worker count.
 
 ## Prerequisites
 
-A C11 compiler and `make`. `coqc` enables the two proof checks; `nvcc` with the CCCL headers enables
+A C11 compiler, POSIX threads and `make` build the evaluator. `coqc` enables L2 and L9. `nvcc` with the CCCL headers enables
 the CCCL experiment. Each is optional, and each check skips by name when its prerequisite is absent,
 never reporting PASS. Without `coqc`, L2, which carries nine of the operation-class table's eleven
 rows, skips with L9, and L3 and L4 still witness seven of those nine; the elementwise and
 data-movement rows then have no witness. `./controls.sh` needs `coqc`, because two of its controls
 break the proofs, and a control that cannot run fails the run.
 
-There is no build system to configure and no dependency to install.
+The standalone Iris check uses Rocq 9.1, Stdlib 9.1 and Iris 4.5. See the [setup instructions](README.md#run-individual-checks).
 
 ## The checks
 
@@ -23,23 +24,26 @@ Every check the harness runs has a row here, and every row here is a check the h
 table used to list ten while the harness ran nineteen, which is the same defect as everything else
 this artefact reports: two representations of one fact with nothing forcing them to agree.
 
-Each check prints one machine-readable line, `RL-STATUS leg=<id> result=... cases=... reason=...`;
-the `leg=` field carries the check's id.
+Each gate prints one machine-readable line, `RL-STATUS leg=<id> result=... cases=... skipped=... reason=...`.
+The harness checks the reported leg ID and result against the invocation and exit status.
 
 | Check | Claim | Command | Expected |
 |---|---|---|---|
-| L1 | CCCL answers the local determinism question and cannot ask the composition one: two programs that must be rejected, and a `not_guaranteed` result feeding a `run_to_run` call that compiles cleanly | `./src/experiments/cccl/run.sh` | `result=PASS cases=6 reason=cccl-composes-without-diagnostic`. Compile-only; needs `nvcc` and the CCCL headers (`pip install nvidia-cuda-nvcc nvidia-cuda-cccl`), else `SKIP no-cccl` |
-| L2 | Section 3.5's operation-class rows, proved of the model evaluator, each invariance row paired with a witness that the same machinery separates schedules | `./scripts/check-proofs-eval.sh` | `result=PASS cases=2 reason=-`. Skips by name without Coq (tag `coq`) |
+| L1 | CCCL answers the local determinism question and cannot ask the composition one: two programs that must be rejected, and a `not_guaranteed` result feeding a `run_to_run` call that compiles cleanly | `./src/experiments/cccl/run.sh` | `result=PASS cases=6 reason=cccl-composes-without-diagnostic`. Compile-only; needs `nvcc` and the CCCL headers (`pip install nvidia-cuda-nvcc nvidia-cuda-cccl`, found in the user site or an active virtual environment, or named with `NVCC=` and `CCCL_ROOT=`), else `SKIP no-cccl` |
+| L2 | The model's operation-class rows, schedule witnesses, binary64 result on acyclic graphs and carried agreement for nested scalar loops. The 28 audited results together use exactly the expected assumptions and 21 are axiom-free | `./scripts/check-proofs-eval.sh` | `result=PASS cases=2 reason=-`. Skips by name without Coq (tag `coq`) |
 | L3 | 171 checker fixtures: verdicts, lanes, blame spans, kernel picks, ungrounded-node counts, and the fixed point's pass bounds | `make -C src/lanelang all && ./build/bin/test_lanelang src/tests/lanelang` | `result=PASS cases=751` |
-| L4 | A pinned value's bits do not move across traversals and worker counts, evaluated on the healed graph and only where accepted; an `exact` value equals the serial reference; a free scan under a pinned fold still moves | `./build/bin/test_schedule` | `result=PASS cases=639 reason=-`: the incident's free sum keeps the recorded bits at 1 of 4 worker counts, and the rest move it first in significant digit 8 |
+| L4 | A pinned value's bits do not move across traversals and worker counts, evaluated on the healed graph and only where accepted; the replay sum checks actual worker participation in all twenty cells; an `exact` value equals the serial reference; a free scan under a pinned fold still moves | `./build/bin/test_schedule` | `result=PASS cases=785 reason=-`. The incident's free sum matches the recording only with three workers. The earliest difference at the other worker counts is in the fifth significant digit |
 | L5 | A blessed checksum is a receipt: a parsed `@bless(n)` with world 1's checksum, evaluated in world 2, is refused by the checksum and not the world | `make -C src/lanelang all && ./build/bin/test_bless` | `result=PASS cases=5` |
 | L6 | The lattice answer is the same over programs the front end parsed, resolved and healed as over hand-built graphs | `./build/bin/lanefuzz --roundtrip 2000` | `result=PASS cases=47740 reason=-`: 47,738 node answers with 0 mismatches; healing strengthened 371 producers and moved 2,809 answers |
 | L7 | The linear join agrees with exhaustive path enumeration, and refuses a graph whose storage order it cannot analyse | `./build/bin/lanefuzz --agree 2000` | `result=PASS cases=60245`: 58,245 node answers with 0 mismatches, plus 2,000 order-permuted graphs the sweep must refuse |
 | L8 | The join sweep is monotone, order-respecting, and non-mutating | `./build/bin/lanefuzz --metamorphic 2000` | `result=PASS cases=8000`: three properties over 2000 random programs |
-| L9 | The theorems of sections 3 to 5, mechanised, resting on exactly the eight declared axioms; an admitted proof fails the audit as an extra axiom | `./scripts/check-proofs.sh` | `result=PASS cases=2 reason=-`. Skips by name without Coq (tag `coq`) |
-| L10 | The harness catches its own breaks: an undeclared skip, a check asserting nothing, a stub with no status line, a drifted ledger count | `./reproduce.sh --self-check` | `THE HARNESS CATCHES ITS OWN BREAKS (5 controls, all fired)`, `result=PASS cases=5`. Runs first |
-| L11 | Everything runs from a clean tree | `./reproduce.sh` cleans and rebuilds before any check | `result=PASS cases=1 reason=built` |
-| L12 | Every check binary was freshly built and says so | each binary prints a `BUILD` line naming its compiler, `std=` and `double=` | `result=PASS cases=4 reason=freshly-built` |
+| L9 | The 14 core results together use exactly the eight declared assumptions. Seven are axiom-free | `./scripts/check-proofs.sh` | `result=PASS cases=2 reason=-`. Skips by name without Coq (tag `coq`) |
+| L10 | The harness catches missing, duplicate or contradictory receipts, zero assertions, ledger drift, undeclared skips and a failed clean target | `./reproduce.sh --self-check` | `THE HARNESS CATCHES ITS OWN BREAKS (9 controls, all fired)`, `result=PASS cases=9`. Runs first |
+| L11 | The checker builds from clean outputs | `./reproduce.sh` runs `make clean` before `make all` and requires both to succeed | `result=PASS cases=1 reason=built` |
+| L12 | The gate binaries carry clean build stamps after L11 succeeds | `./reproduce.sh` reads the `BUILD` lines and checks that the make target is up to date | `result=PASS cases=4 reason=freshly-built` |
+
+The optional single-worker sum benchmark measures the three kernels on the same input.
+Run `make bench-sums` for the timings. [Method and comparison](README.md#what-each-lane-lets-the-compiler-optimise)
 
 ## The controls
 
@@ -56,7 +60,7 @@ is decorative.
 | CC1 | The grounding judgement removed | `FIRED: without grounding, 9 demand(s) over an external source were accepted` |
 | CC2 | The fixed tree's bracketing made to follow the worker count, so the row saying its bits are a function of `(data, shape)` stops being true | `FIRED: the fixed tree made to read the worker count; the row is no longer provable (proof-does-not-compile)` |
 | CC3 | The fixed-block scan's frozen leaf width made to follow the worker count | `FIRED: letting the worker count pick the scan's leaf width moved N pinned value(s)` |
-| CC4 | `exact` discharged by the fixed tree rather than the oracle order | `FIRED: the fixed tree discharged exact with all 18 schedule-invariance assertion(s) still green; only the reference comparison saw it` |
+| CC4 | `exact` discharged by the fixed tree rather than the oracle order | `FIRED: the fixed tree differed from the serial reference while all 23 schedule-invariance checks passed` |
 | CC5 | the contract removed from the value-numbering key | `FIRED: twins collapsed [fold_free] where the contract keeps them distinct [fold_free fold_replay]` |
 | CC6 | a malformed program | `FIRED: reported malformed (exit 2), not as a lane violation` |
 | CC7 | The evaluator made to fail a pinned fold after the checker accepted the program | `FIRED: an accepted pinned program failed to evaluate at N lane(s); L4 reported it as a failure, not as a refusal` |

@@ -12,36 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "dag.h"
 #include "heal.h"
+
+#include "dag.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-// HEAL_SNAPSHOT_MAX is how many nodes have their schedule class remembered before the
-// pass runs, so heal_program can report how many changed; a larger graph is still healed
-// in full, and the reported count is then a lower bound.
-#define HEAL_SNAPSHOT_MAX 512
-
-// The helpers live inside the guard with their only caller. `lanelang_noheal`, the binary
-// the healing control builds, compiles this file with -DLANELANG_NO_HEAL, which removes
-// that caller; a helper left outside the guard would then be defined and unused, so the
-// control build would fail under -Wall -Wextra -Werror while the ordinary build stayed
-// clean.
+// The healing control builds `lanelang_noheal` with -DLANELANG_NO_HEAL. Its build omits
+// these helpers with their only caller so that -Wall -Wextra -Werror stays clean.
 #ifndef LANELANG_NO_HEAL
 
-// class_for is the schedule class that discharges a demand for lane `want`, in `node`'s
-// own operation family.
+// class_for selects the class that the operation family can offer for lane `want`.
 //
-// A strengthened class has to be one the node's own lowering can emit, or the heal writes
-// a lane the kernel never honours: a scan given a fold's class reads as pinned to the
-// checker and still lowers to the free kernel, a silent wrong answer rather than a
-// refusal. The offer is the strongest class the family has, not always the one asked for:
-// this build routes no `exact` demand to a scan, so such a demand is offered
-// the blocked class, whose lane is `replay`, and the refusal then comes from
-// lattice_check comparing `replay` against the demand rather than from this function
-// declining to pin. The blocked scan's bits are a function of (data, shape) alone, so the
-// weaker offer is conservative.
+// Folds can meet an `exact` demand with the serial kernel. The strongest scan kernel in
+// this build is the fixed-block scan, whose lane is `replay`. Offering that class keeps
+// the computed lane faithful to the kernel and leaves lattice_check to report the unmet
+// `exact` demand.
 //
 // Takes node (dagnode_t) which is the node under examination.
 // Takes want (lane_t) which is the lane being demanded.
@@ -56,16 +43,13 @@ static opclass_t class_for(const dagnode_t *node, const lane_t want) {
     }
 }
 
-// pin_node strengthens `node` to discharge a demand for lane `want`, if it is unannotated
-// and its class can be strengthened at all.
+// pin_node strengthens a producer's schedule class towards lane `want` when its operation
+// family permits it.
 //
-// A neutral node is left alone, a test written as a property of the class so that a
-// second reduction family needs no change here. The lane written back is the class's
-// rather than the demand's, because the two differ wherever the family has no discharge
-// for the demand, an `exact` demand on a scan being offered the blocked class whose lane
-// is `replay`; writing `want` there would record a node as built under a lane its own
-// kernel does not deliver, and `lane` is in the interning key, so the discrepancy would
-// decide which nodes are one node. Privacy is decided by mark_escapes, not here.
+// Neutral operations keep their class. For other operations the lane stored in the
+// interning key comes from the selected kernel. For example, an `exact` demand on a scan
+// can strengthen it only to `replay`. The caller checks privacy and binding qualifiers
+// before reaching this point.
 //
 // Takes node (dagnode_t) which is the node under examination.
 // Takes want (lane_t) which is the lane being demanded.
@@ -81,36 +65,12 @@ static void pin_node(dagnode_t *node, const lane_t want) {
     node->lane = opclass_lane(wanted);
 }
 
-// mark_cone marks every node reachable from `at` by reading, which is the demanded cone.
-//
-// The carried edge is a read like any other, so a recurrence's body is inside the cone of
-// a demand on the recurrence.
-//
-// Takes g (dag_t) which is the graph being walked.
-// Takes count (int) which is how many nodes the graph holds.
-// Takes at (int) which is the node to start from.
-// Takes cone (char) which marks the nodes inside the demanded cone.
-static void mark_cone(const dag_t *g, const int count, const int at, char *cone) {
-    if (at < 0 || at >= count || cone[at]) {
-        return;
-    }
-    cone[at] = 1;
-    const dagnode_t *node = dag_at_const(g, at);
-    for (int k = 0; k < node->input_count; k++) {
-        mark_cone(g, count, node->in[k], cone);
-    }
-    if (node->carried >= 0) {
-        mark_cone(g, count, node->carried, cone);
-    }
-}
-
 // mark_inputs_escaping propagates one consumer's escape to everything it reads, and
 // reports whether that changed anything.
 //
-// Outside the cone a consumer makes everything it reads escape; inside it a consumer
-// passes on its own escape, unless it is the node stating the demand, where the path is
-// cut, because a change that reaches an outsider only through the demanded value is a
-// change the annotation licenses.
+// A live consumer outside the cone makes its inputs escape. Inside the cone an escaping
+// consumer passes that mark to its inputs. The demand itself cuts the path because the
+// annotation licenses changes observed through the demanded value.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes at (int) which is the consumer whose reads are being marked.
@@ -143,15 +103,11 @@ static int mark_inputs_escaping(const dag_t *g, const int at, const int root,
 
 // mark_escapes marks every node with a live read-path leaving the cone rooted at `root`.
 //
-// A producer is private to a demand when nothing outside that demand can observe a change
-// to it, and the rule is a closure because one neutral binding can hide an escape: with
-// `p := sum(x*0.5)` feeding only `a := p + 1.0` inside the cone, `p` would be pinned
-// while `a` is also read outside it, so the bits an outsider observes move. The path is
-// cut at the root, because without the cut every demand whose own result feeds anything
-// else would mark its whole cone as escaping and heal nothing, and a change that reaches
-// an outsider only through the demanded value is licensed by the annotation. The marking
-// runs to a fixpoint rather than one sweep, because the carried edge may point forward,
-// so escape can travel from a later index to an earlier one and back.
+// A producer is private if an outside reader can observe it only through the demand.
+// Suppose `p := sum(x*0.5)` feeds `a := p + 1.0` inside the cone and an outsider also
+// reads `a`. Pinning `p` could change the value seen by the outsider. The escape
+// therefore propagates through `a` to `p`. The demand itself cuts such paths. The marks
+// run to a fixed point because a carried edge can refer to a later node.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -169,15 +125,13 @@ static void mark_escapes(const dag_t *g, const int count, const int root, const 
     }
 }
 
-// pin_cone walks the demanded cone rooted at `at` and pins every producer private to it
-// to lane `want`.
+// pin_cone walks the demanded cone rooted at `at` and strengthens eligible private
+// producers towards lane `want`.
 //
-// The walk descends unconditionally and tests each node on its own, because refusing to
-// descend through a node with more than one operand edge would truncate the cone and
-// leave a fold two levels further up unreached. A demand rides on an OP_DEMAND node of
-// its own: the escaping reader reads that wrapper, which is neutral, so pinning it is a
-// no-op, and the producer beneath it has the wrapper as its only consumer and never
-// escapes.
+// A binding that explicitly states a different lane stops this walk. Otherwise it visits
+// each operand and the carried edge, even when the current node escapes. Escape marks
+// decide whether a producer itself may be pinned. A demand wrapper is neutral, so pinning
+// the wrapper leaves its class unchanged.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -207,45 +161,12 @@ static void pin_cone(dag_t *g, const int count, const int at, const lane_t want,
     }
 }
 
-// snapshot_classes records the schedule class of the first `limit` nodes into `classes`,
-// so a later pass can count what the healing changed.
-//
-// Takes g (dag_t) which is the graph being walked.
-// Takes classes (int) which holds the class of each node.
-// Takes limit (int) which bounds how many may be recorded.
-static int snapshot_classes(dag_t *g, int *classes, const int limit) {
-    const int recorded = dag_count(g) < limit ? dag_count(g) : limit;
-    for (int i = 0; i < recorded; i++) {
-        classes[i] = (int) dag_at(g, i)->op_class;
-    }
-    return recorded;
-}
-
-// count_changed counts how many of the `recorded` nodes now hold a schedule class other
-// than the one `classes` remembered.
-//
-// Takes g (dag_t) which is the graph being walked.
-// Takes classes (int) which holds the class of each node.
-// Takes recorded (int) which is how many entries were written.
-static int count_changed(dag_t *g, const int *classes, const int recorded) {
-    int changed = 0;
-    for (int i = 0; i < recorded; i++) {
-        if (classes[i] != (int) dag_at(g, i)->op_class) {
-            changed++;
-        }
-    }
-    return changed;
-}
-
 // pin_one_demand runs the inference from the single demand stated at `at`.
 //
-// A value the program hands back has a reader the graph does not hold: every other
-// consumer is a node the escape walk finds by following an edge, and the caller is not,
-// so `escapes` is seeded at `result` before the walk. Left unseeded, a demand that
-// reaches that value from the side would pin a producer whose bits the caller observes,
-// and adding a binding nobody reads would change the number the program computed. The cut
-// at the root still applies, so a demand on the value handed back licenses its own
-// change.
+// The caller is a reader of the result with no edge in the graph. Seeding `escapes` at
+// `result` accounts for that reader. Without it, adding an unused demand could pin a
+// producer whose bits the caller observes directly. The demand at the root still cuts
+// escape propagation through its own value.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -259,7 +180,7 @@ static void pin_one_demand(dag_t *g, const int count, const int at, const int re
     memset(seen, 0, sizeof(int) * (size_t) count);
     memset(cone, 0, (size_t) count);
     memset(escapes, 0, (size_t) count);
-    mark_cone(g, count, at, cone);
+    dag_mark_cone(g, at, cone);
     if (result >= 0 && result < count) {
         escapes[result] = 1;
     }
@@ -270,9 +191,8 @@ static void pin_one_demand(dag_t *g, const int count, const int at, const int re
 // pin_every_demanded_cone runs the inference from every node that states a demand, over a
 // graph of `count` nodes.
 //
-// Each demand gets its own cone mark and its own escape set, because privacy is relative
-// to the demand being discharged: a producer may be private to one and shared out of
-// another.
+// Each demand gets its own cone mark and escape set. The same producer can be private to
+// one demand while another demand shares it with an outside reader.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
@@ -297,9 +217,9 @@ static void pin_every_demanded_cone(dag_t *g, const int count, const int result,
 
 #endif  // LANELANG_NO_HEAL
 
-// heal_program strengthens every private producer inside a demanded cone, and returns how
-// many nodes changed class; under -DLANELANG_NO_HEAL, the healing control, it does
-// nothing and reports nothing healed.
+// heal_program strengthens eligible private producers in demanded cones and returns the
+// number of nodes whose class changed. The healing control built with -DLANELANG_NO_HEAL
+// returns zero.
 //
 // The recount is done here rather than at the call sites, because mark_escapes reads
 // `uses` to skip dead consumers and the counts must be current when the pass runs.
@@ -318,15 +238,21 @@ int heal_program(dag_t *g, const int result) {
     }
     dag_recount_uses(g, result);
     int *seen = (int *) calloc((size_t) count, sizeof(int));
-    if (!seen) {
+    opclass_t *before = malloc((size_t) count * sizeof *before);
+    if (!seen || !before) {
+        free(before);
+        free(seen);
         return 0;
     }
-
-    int before[HEAL_SNAPSHOT_MAX];
-    const int recorded = snapshot_classes(g, before, HEAL_SNAPSHOT_MAX);
+    for (int i = 0; i < count; i++) {
+        before[i] = dag_at_const(g, i)->op_class;
+    }
     pin_every_demanded_cone(g, count, result, seen);
-    const int changed = count_changed(g, before, recorded);
-
+    int changed = 0;
+    for (int i = 0; i < count; i++) {
+        changed += before[i] != dag_at_const(g, i)->op_class;
+    }
+    free(before);
     free(seen);
     return changed;
 #endif

@@ -16,7 +16,7 @@ package app
 // EXPECT: accept ungrounded-nodes=4
 // EXPECT-KERNEL: fold_replay
 func main() Float {
-    @bless(0x1234abcd) x := source(count: 1000.0)
+    @bless(0x7185a13e) x := source(count: 1000.0)
     replay energy := sum(x * 2.0)
     return energy
 }

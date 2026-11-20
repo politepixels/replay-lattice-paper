@@ -25,19 +25,17 @@
 // past the limit is reported rather than dropped.
 #define SCOPE_CAPACITY 128
 
-// MAX_INLINE_DEPTH is how many calls deep inlining may go; reaching it is reported as a
-// call nesting error, so recursion is refused before it exhausts the C stack.
+// MAX_INLINE_DEPTH bounds the nesting of inlined calls. The resolver reports a call
+// nesting error at the limit.
 #define MAX_INLINE_DEPTH 32
 
 // MAX_INLINED_CALLS is how many call sites one lowering may inline, a bound on work
 // rather than depth because inlining branches and the site count can double per nesting
-// level. Reaching it is a refusal, because a checker that cannot answer says so rather
-// than appearing to hang.
+// level. The resolver refuses the next call once this many have been admitted.
 #define MAX_INLINED_CALLS 200000L
 
-// CHOOSE_ARGUMENT_COUNT is how many operands choose() takes: the mask and the two arms.
-// The arity check and the node's input count are the same number by construction, so a
-// fourth operand cannot be read out of an array sized for three.
+// CHOOSE_ARGUMENT_COUNT counts the mask and both arms of `choose`. The resolver uses the
+// same bound for the arity check and for the node's input count.
 #define CHOOSE_ARGUMENT_COUNT 3
 
 // CONST_LABEL is the label a literal node carries, a literal having no source name of its
@@ -60,8 +58,8 @@ typedef struct {
     int node;
 } binding_t;
 
-// resolve_state_t is everything one lowering carries: where names are bound, what demand
-// is in force, and how deep the inlining has gone.
+// resolve_state_t holds the name bindings, ambient lane and inlining state for one
+// lowering.
 typedef struct {
     // program is the program being lowered, for finding a called function.
     program_t *program;
@@ -69,7 +67,7 @@ typedef struct {
     // dag is the graph being built.
     dag_t *dag;
 
-    // diagnostics is the sink that receives one diagnostic per structural defect.
+    // diagnostics receives errors reported while lowering the program.
     diagnostic_t *diagnostics;
 
     // scope is the names in scope, innermost last.
@@ -81,17 +79,21 @@ typedef struct {
     // ambient is the lane stamped on every node built now.
     lane_t ambient;
 
-    // promise_scope is the identity stamped on every node built now, naming the call
-    // whose declared return lane the lowering is currently inside, or 0 outside every
-    // such call.
+    // promise_scope marks nodes passed to intern_or_report. It identifies the innermost
+    // inlined call with a declared return lane and is zero outside such calls.
     int promise_scope;
 
-    // next_promise_scope is the identity the next lane-publishing call will take. Counted
-    // per lowering, so two calls to one function are two scopes.
+    // next_promise_scope holds the last promise scope allocated during this lowering. The
+    // next call that publishes a return lane increments it to obtain a fresh scope.
     int next_promise_scope;
 
     // depth is how many calls deep the inlining currently is.
     int depth;
+
+    // active holds the function being lowered and each function inlined inside it, with
+    // the lowered function first and `depth + 1` entries in use. A call to any of them is
+    // recursion.
+    const func_t *active[MAX_INLINE_DEPTH + 1];
 
     // inlined is how many call sites this lowering has inlined so far, separate from
     // `depth` because depth bounds the C stack and this bounds the work, which can double
@@ -102,7 +104,7 @@ typedef struct {
     int malformed;
 } resolve_state_t;
 
-// names_equal compares two source names, neither of which is NUL terminated.
+// names_equal compares the given numbers of bytes in two names.
 //
 // Takes left (char) which is the first operand.
 // Takes left_length (int) which is the first run's length.
@@ -115,9 +117,7 @@ static int names_equal(const char *left, const int left_length, const char *righ
 // NAMES_EQUAL_LITERAL compares a counted source name against a string literal, taking the
 // length from the literal itself rather than from a number written beside it.
 //
-// Written as a macro because `sizeof` keeps the pair together: a hand written length is a
-// second copy of the spelling that a rename does not update, and it would still compile
-// and silently match nothing once the word grew a letter.
+// The macro uses `sizeof` so the length follows the literal when its spelling changes.
 #define NAMES_EQUAL_LITERAL(name, length, literal) \
     names_equal((name), (length), (literal), (int) (sizeof(literal) - 1))
 
@@ -144,23 +144,22 @@ int scope_bind(resolve_state_t *state, const char *name, const int name_length, 
 int declare_demand(resolve_state_t *state, const int node, const lane_t demand,
                    const span_t at);
 
-// declare_return_promise applies a callee's declared return lane to the value it returns,
-// carrying it on a node of its own, and reports a body that promises less than its
-// signature.
+// declare_return_promise checks a declared return lane against an explicit lane on the
+// returned binding. It adds a demand when the result carries none.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes node (int) which is the node the function returns.
 // Takes function (func_t) which is the function whose signature this is.
-// Returns the node the promise is carried on, or -1 after reporting a weaker body.
+// Returns the node carrying the promise, or -1 if the body states a weaker lane or the
+// demand node could not be allocated.
 int declare_return_promise(resolve_state_t *state, const int node, const func_t *function);
 
-// declare_call_promise applies a callee's declared return lane at a call site, as a demand
-// on the value its inlined body returns, nested over any lane that value states which does
-// not satisfy it.
+// declare_call_promise applies a function's declared return lane to its lowered result.
+// It reuses an existing demand that satisfies the promise.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
-// Takes node (int) which is the node the inlined body returns.
-// Takes function (func_t) which is the function called.
+// Takes node (int) which is the node the body returns.
+// Takes function (func_t) which declares the return lane.
 // Returns the node the promise is carried on, or -1 after reporting a defect.
 int declare_call_promise(resolve_state_t *state, const int node, const func_t *function);
 
@@ -172,7 +171,7 @@ int declare_call_promise(resolve_state_t *state, const int node, const func_t *f
 // Returns the node's index, or -1 after reporting a defect.
 int intern_or_report(resolve_state_t *state, const dagnode_t *node, const span_t at);
 
-// lower_expr lowers one expression, entering any demand written on it.
+// lower_expr lowers one expression under the current ambient lane.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes expression (expr_t) which is the expression being lowered.
@@ -215,8 +214,7 @@ int lower_scan(resolve_state_t *state, expr_t *call);
 // Returns the node's index, or -1 after reporting a defect.
 int lower_choose(resolve_state_t *state, expr_t *call);
 
-// lower_source lowers source(), a leaf the program does not fix; a call to an
-// `ungrounded` declaration is the other.
+// lower_source lowers `source()` to a leaf whose value depends on the outside world.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -231,8 +229,7 @@ int lower_source(resolve_state_t *state, expr_t *call);
 // Returns the node's index, or -1 after reporting a defect.
 int lower_sum(resolve_state_t *state, expr_t *call, const int integer);
 
-// count_is_whole reports whether `value` is a whole number the checker can read as a
-// count.
+// count_is_whole reports whether a finite, non-negative value is a whole number.
 //
 // Takes value (double) which is the literal being examined.
 // Returns non-zero when it is whole.
@@ -261,4 +258,4 @@ func_t *find_function(program_t *program, const char *name, const int name_lengt
 // Returns the node's index, or -1 after reporting a defect.
 int lower_call(resolve_state_t *state, expr_t *call);
 
-#endif
+#endif  // LANELANG_RESOLVE_INTERNAL_H

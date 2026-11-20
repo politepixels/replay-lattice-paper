@@ -17,10 +17,12 @@
 
 #include "dag.h"
 
-// heal_program strengthens every private producer inside a demanded cone.
+// heal_program strengthens eligible private producers inside demanded cones. A binding
+// that states a different lane stops this traversal along that path.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
+// Returns the number of nodes whose schedule class changed.
 int heal_program(dag_t *g, int result);
 
 #endif  // LANELANG_HEAL_H

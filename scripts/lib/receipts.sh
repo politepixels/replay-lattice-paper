@@ -29,22 +29,32 @@ rl_make_work_directory() {
 # Inputs:
 #   The text to read, on stdin
 # Outputs:
-#   The field's value on stdout, or nothing
+#   The field's value from the last receipt, empty if the field is missing or repeated
 rl_status_field() {
-    case "$1" in
-        cases|skipped) sed -n "s/.*$1=\([0-9]*\).*/\1/p" | tail -1 ;;
-        *)             sed -n "s/.*$1=\([^ ]*\).*/\1/p" | tail -1 ;;
-    esac
+    awk -v key="$1" '$1 == "RL-STATUS" {
+        value = ""
+        seen = 0
+        for (i = 2; i <= NF; i++) {
+            if (index($i, key "=") == 1) {
+                if (++seen > 1) { value = ""; break }
+                value = substr($i, length(key) + 2)
+            }
+        }
+    }
+    END { print value }'
 }
 
-# rl_report_row prints one row of a run table: a leg, its result, its case count and its reason.
+# rl_report_row formats one leg's result for the run table.
+# Globals:
+#   RL_SORT_ROWS - Read
+#   RL_ROW_BUFFER - Appended when RL_SORT_ROWS is 1
 # Arguments:
-#   $1 - The leg id
+#   $1 - The leg ID
 #   $2 - PASS, SKIP or FAIL
-#   $3 - How many cases the leg asserted
+#   $3 - The case count reported for the leg
 #   $4 - The reason token, or a phrase where the row carries no token
 # Outputs:
-#   One fixed-width row on stdout
+#   One fixed-width row on stdout when buffering is off
 rl_report_row() {
     if [ "${RL_SORT_ROWS:-0}" = 1 ]; then
         RL_ROW_BUFFER="${RL_ROW_BUFFER:-}$(printf '%-4s %-4s %5s  %s' "$1" "$2" "$3" "$4")"$'\n'
@@ -53,8 +63,8 @@ rl_report_row() {
     fi
 }
 
-# rl_flush_rows prints the buffered rows in id order, so a table whose legs run in dependency
-# order still reads in numeric order. The sort key starts at the id's second character, which is
+# rl_flush_rows prints the buffered rows in ID order, so a table whose legs run in dependency
+# order still reads in numeric order. The sort key starts at the ID's second character, which is
 # where the number begins.
 # Globals:
 #   RL_ROW_BUFFER - Read and cleared

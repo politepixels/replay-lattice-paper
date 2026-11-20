@@ -18,15 +18,14 @@
 #include "dag.h"
 #include "lane.h"
 
-// oracle_lane is the reference lane for `node` of graph `g`, by path enumeration.
+// oracle_lane computes the reference lane by enumerating operand paths in an acyclic
+// graph. It returns LANE_NONE if the node is out of range or the walk exceeds its limit.
 //
-// `cap` bounds how many complete paths may be walked. Returns LANE_NONE when `cap` was
-// exceeded, in which case the caller must count the DAG as skipped, not as agreeing.
-//
-// Takes g (dag_t) which is the graph being walked.
-// Takes node (int) which is the node under examination.
-// Takes cap (long) which bounds how much work the walk may do.
-// Takes paths_out (long) which receives how many complete paths were walked.
+// Takes g (dag_t) which holds the graph.
+// Takes node (int) which is the index of the node to check.
+// Takes cap (long) which is the largest number of complete paths accepted.
+// Takes paths_out (long) which receives the number of complete paths visited for a valid
+// node, if supplied.
 lane_t oracle_lane(const dag_t *g, int node, long cap, long *paths_out);
 
 #endif  // LANELANG_ORACLE_H

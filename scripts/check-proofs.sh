@@ -23,8 +23,7 @@ cd "$(dirname "$0")/.." || exit 1
 # deliberately broken copy without touching the shipped one.
 PROOF_DIR="${RL_PROOF_DIR:-src/proofs}"
 
-# The complete list of parameters the mechanised results may rest on; anything beyond it
-# fails the audit.
+# The audit checks the combined set of assumptions reported for the selected core results.
 EXPECTED_AXIOMS="Gated bits eval oracle oracle_ungated schedule some_gated world"
 
 # The scratch directory holding the build and audit logs, removed on a trap.
@@ -73,8 +72,7 @@ compile_development() {
     fi
 }
 
-# write_assumptions_query writes the audit script: one Print Assumptions per mechanised
-# result the paper names.
+# write_assumptions_query asks Coq for the assumptions of each audited core result.
 # Globals:
 #   WORK - Read
 write_assumptions_query() {
@@ -112,7 +110,7 @@ run_assumptions_query() {
 }
 
 # check_axiom_set asserts that the set of axioms observed across every audited result is
-# exactly the declared set, so an admitted proof surfaces as an extra axiom and fails.
+# exactly the declared set. An admitted lemma used by an audited proof adds its name to the set.
 # Globals:
 #   WORK, EXPECTED_AXIOMS - Read
 #   cases - Incremented when the assertion holds
@@ -125,8 +123,7 @@ check_axiom_set() {
                      inblock && /^[A-Za-z_][A-Za-z0-9_'"'"']* :/ {print $1}' \
                 "$WORK/assumptions.log" | sort -u | tr '\n' ' ')"
     observed="${observed% }"
-    # shellcheck disable=SC2086
-    expected="$(printf '%s\n' $EXPECTED_AXIOMS | sort -u | tr '\n' ' ')"
+    expected="$(tr ' ' '\n' <<< "$EXPECTED_AXIOMS" | sort -u | tr '\n' ' ')"
     expected="${expected% }"
     if [ "$observed" != "$expected" ]; then
         printf '    expected axioms: %s\n    observed axioms: %s\n' "$expected" "$observed" >&2
@@ -135,8 +132,7 @@ check_axiom_set() {
     cases=$((cases + 1))
 }
 
-# check_axiom_free_count asserts, as an equality rather than a floor, how many audited
-# results rest on nothing at all; raise the number in the same edit that closes a result.
+# check_axiom_free_count checks the exact number of audited results that are axiom-free.
 # Globals:
 #   WORK - Read
 #   cases - Incremented when the assertion holds
@@ -152,7 +148,7 @@ check_axiom_free_count() {
     cases=$((cases + 1))
 }
 
-# main runs the audit in order: build, query, then the two assertions.
+# main builds the proof, runs the query and checks both assertions.
 # Globals:
 #   WORK - Set
 #   PROOF_DIR - Read

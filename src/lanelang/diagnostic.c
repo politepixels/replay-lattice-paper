@@ -19,25 +19,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-// MAX_DIAGNOSTICS is how many diagnostics one sink retains; reports past this limit are
-// dropped, which bounds the sink when a caller keeps reporting in a loop.
+// MAX_DIAGNOSTICS bounds the number of reports a sink retains. Further reports are
+// dropped when the sink is full.
 #define MAX_DIAGNOSTICS 64
 
 // MESSAGE_MAX is the size in bytes of one formatted message, including the terminator. A
 // longer message is truncated by vsnprintf rather than overrunning the entry.
 #define MESSAGE_MAX 512
 
-// QUOTED_LINE_MAX is the longest source line the renderer will quote, in bytes including
-// the terminator. A longer line is quoted up to this width and the caret row is
-// unaffected, because the caret row is built from the span's own column rather than from
-// the quoted text.
+// QUOTED_LINE_MAX bounds the number of source bytes quoted around a diagnostic span.
 #define QUOTED_LINE_MAX 512
 
 // ENTRY_ERROR is the kind tag for an entry that is an error. Only these are counted by
 // diagnostic_error_count.
 #define ENTRY_ERROR 0
 
-// ENTRY_NOTE is the kind tag for an entry that is a note attached to the error before it.
+// ENTRY_NOTE marks an informational report. A note may accompany an error or stand alone.
 #define ENTRY_NOTE 1
 
 // entry_t is one recorded diagnostic.
@@ -61,7 +58,7 @@ typedef struct {
     char message[MESSAGE_MAX];
 } entry_t;
 
-// diag is a diagnostic sink: the source it reports against, and the reports made so far.
+// diag holds the source text and the reports recorded against it.
 struct diag {
     // file is the name of the file being reported on, borrowed, or NULL to render as
     // "<input>".
@@ -162,7 +159,7 @@ void diagnostic_error_with_cause(diagnostic_t *sink, const span_t primary, const
     va_end(ap);
 }
 
-// diagnostic_note reports a note at `at`, attached to the error before it.
+// diagnostic_note records an informational message at `at`.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 // Takes at (span_t) which is the source position to blame.
@@ -173,7 +170,7 @@ void diagnostic_note(diagnostic_t *sink, const span_t at, const char *fmt, ...) 
     va_end(ap);
 }
 
-// diagnostic_error_count is how many errors the sink holds; notes are not counted.
+// diagnostic_error_count counts the error entries retained by the sink.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 int diagnostic_error_count(const diagnostic_t *sink) {
@@ -212,7 +209,7 @@ void diagnostic_rewind(diagnostic_t *sink, const int mark) {
 // the sink holds one.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
-// Takes primary (span_t) which receives the demand site.
+// Takes primary (span_t) which receives the location of the first error.
 // Takes secondary (span_t) which receives the span that lost the guarantee.
 // Takes hops (int) which receives the hop count between the two.
 int diagnostic_first_spans(const diagnostic_t *sink, span_t *primary, span_t *secondary, int *hops) {
@@ -237,56 +234,56 @@ int diagnostic_first_spans(const diagnostic_t *sink, span_t *primary, span_t *se
     return 0;
 }
 
-// diagnostic_line_text copies the 1-based line `wanted` out of `source` into `buffer`,
-// which holds `capacity` bytes including the terminator.
+// diagnostic_line_start finds the first byte of a source line, including an empty final
+// line.
 //
 // Takes source (char) which is the source text, borrowed.
-// Takes wanted (int) which is the 1-based line to copy.
-// Takes buffer (char) which receives the bytes.
-// Takes capacity (size_t) which bounds how many entries may be written.
-static int diagnostic_line_text(const char *source, const int wanted, char *buffer, const size_t capacity) {
+// Takes wanted (int) which is the line number, counting from one.
+// Returns a pointer into the source, or NULL if the line is absent.
+static const char *diagnostic_line_start(const char *source, const int wanted) {
     if (!source || wanted < 1) {
-        return -1;
+        return NULL;
     }
-    int line = 1;
-    const char *cursor = source;
-    while (line < wanted && *cursor) {
-        if (*cursor == '\n') {
-            line++;
+    for (int line = 1; line < wanted; line++) {
+        const char *newline = strchr(source, '\n');
+        if (!newline) {
+            return NULL;
         }
-        cursor++;
+        source = newline + 1;
     }
-    if (line != wanted) {
-        return -1;
-    }
-    const char *end = cursor;
-    while (*end && *end != '\n') {
-        end++;
-    }
-    size_t length = (size_t) (end - cursor);
-    if (length >= capacity) {
-        length = capacity - 1;
-    }
-    memcpy(buffer, cursor, length);
-    buffer[length] = '\0';
-    return (int) length;
+    return source;
 }
 
-// diagnostic_render_markers writes the caret row that sits under a quoted source line:
-// leading blanks up to the span's column, then `marker` repeated across the span's width,
-// then `label` if there is one.
+// diagnostic_excerpt_start chooses where to begin quoting a source line. It keeps the
+// start of the span in view and leaves room for context on either side.
 //
-// Takes stream (FILE) which is where the output is written.
-// Takes span (span_t) which is the source position to blame.
-// Takes marker (char) which is the marker repeated across the span's width.
-// Takes label (char) which is the annotation written after the underline, or empty.
-static void diagnostic_render_markers(FILE *stream, const span_t span, const char *marker, const char *label) {
-    fprintf(stream, "       | ");
-    for (int i = 1; i < span.column; i++) {
-        fputc(' ', stream);
+// Takes length (size_t) which is the length of the line in bytes.
+// Takes column (size_t) which is the span's byte offset from the start of the line.
+// Takes width (size_t) which is the number of source bytes to underline.
+static size_t diagnostic_excerpt_start(const size_t length, const size_t column, const size_t width) {
+    if (length <= QUOTED_LINE_MAX || column + width <= QUOTED_LINE_MAX) {
+        return 0;
     }
-    const int marker_width = span.length > 0 ? span.length : 1;
-    for (int i = 0; i < marker_width; i++) {
+    const size_t context = QUOTED_LINE_MAX / 2;
+    const size_t start = column > context ? column - context : 0;
+    return start < length - QUOTED_LINE_MAX ? start : length - QUOTED_LINE_MAX;
+}
+
+// diagnostic_render_marks writes the underline after the gutter, preserving tab stops in
+// the source before the first marker.
+//
+// Takes stream (FILE) which receives the underline.
+// Takes text (char) which points to the first source byte in the excerpt.
+// Takes padding (size_t) which counts source bytes before the span.
+// Takes width (size_t) which is the number of visible marker characters.
+// Takes marker (char) which is the marker to repeat.
+// Takes label (char) which is the annotation to append, if present.
+static void diagnostic_render_marks(FILE *stream, const char *text, const size_t padding,
+                                    const size_t width, const char *marker, const char *label) {
+    for (size_t i = 0; i < padding; i++) {
+        fputc(text[i] == '\t' ? '\t' : ' ', stream);
+    }
+    for (size_t i = 0; i < width; i++) {
         fputs(marker, stream);
     }
     if (label && *label) {
@@ -295,9 +292,10 @@ static void diagnostic_render_markers(FILE *stream, const span_t span, const cha
     fputc('\n', stream);
 }
 
-// diagnostic_render_span quotes the source line a span lies on and underlines the span
-// itself with `marker`, annotating the underline with `label`. Renders nothing when the
-// span is absent or its line is not in the source.
+// diagnostic_render_span quotes and underlines the source at a span.
+//
+// A long line is cropped around the span. The underline follows the same tabs as the
+// excerpt and marks a missing token at the end of the line with one marker.
 //
 // Takes stream (FILE) which is where the output is written.
 // Takes source (char) which is the source text, borrowed.
@@ -311,21 +309,40 @@ static void diagnostic_render_span(
     const char *marker,
     const char *label
 ) {
-    if (span.line <= 0) {
+    const char *line = diagnostic_line_start(source, span.line);
+    if (!line) {
         return;
     }
-    char line_buffer[QUOTED_LINE_MAX];
-    if (diagnostic_line_text(source, span.line, line_buffer, sizeof line_buffer) < 0) {
-        return;
+    size_t length = strcspn(line, "\n");
+    if (length && line[length - 1] == '\r') {
+        length--;
     }
-    fprintf(stream, "  %4d | %s\n", span.line, line_buffer);
-    diagnostic_render_markers(stream, span, marker, label);
+    size_t column = span.column > 0 ? (size_t) span.column - 1 : 0;
+    if (column > length) {
+        column = length;
+    }
+    size_t width = span.length > 0 ? (size_t) span.length : 1;
+    const size_t start = diagnostic_excerpt_start(length, column, width);
+    const size_t end = length - start > QUOTED_LINE_MAX ? start + QUOTED_LINE_MAX : length;
+    const int gutter = fprintf(stream, "  %4d", span.line);
+    fputs(start ? " | ..." : " | ", stream);
+    for (size_t i = start; i < end; i++) {
+        fputc(line[i] == '\r' ? ' ' : (unsigned char) line[i], stream);
+    }
+    fputs(end < length ? "...\n" : "\n", stream);
+
+    fprintf(stream, "%*s | ", gutter, "");
+    if (start) {
+        fputs("   ", stream);
+    }
+    if (width > end - column) {
+        width = end > column ? end - column : 1;
+    }
+    diagnostic_render_marks(stream, line + start, column - start, width, marker, label);
 }
 
-// diagnostic_primary_label chooses the label for an entry's primary underline. Only an
-// error's primary span is the demand site, and only when the entry has a second end; a
-// note points at whatever it is about, so labelling it "the demand is stated here" would
-// be false.
+// diagnostic_primary_label labels the demand site of a two-span error. Notes and
+// single-span errors have an empty label.
 //
 // Takes entry (entry_t) which is the entry whose label is chosen.
 static const char *diagnostic_primary_label(const entry_t *entry) {
@@ -334,8 +351,8 @@ static const char *diagnostic_primary_label(const entry_t *entry) {
            : "";
 }
 
-// diagnostic_render_entry renders one entry: the message line, the primary span, and,
-// when the entry has a second end, the hop count and the span that lost the guarantee.
+// diagnostic_render_entry prints the message and its primary span. For a two-span error
+// it also prints the hop count and the span where the guarantee was lost.
 //
 // Takes stream (FILE) which is where the output is written.
 // Takes sink (diagnostic_t) which is where diagnostics are collected.

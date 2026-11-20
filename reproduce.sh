@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+#
 # Usage:
-#   ./reproduce.sh                          run everything; skips are reported, not fatal
-#   ./reproduce.sh --expect-skips=coq,cccl  exactly these may skip; any other skip fails
+#   ./reproduce.sh                          run every check and report skips
+#   ./reproduce.sh --expect-skips=coq,cccl  allow only the named skips
 #   ./reproduce.sh --list                   print the leg table and exit
 #   ./reproduce.sh --self-check             the harness's own must-fail controls, then exit
 
@@ -25,8 +25,7 @@ cd "$(dirname "$0")" || exit 1
 # shellcheck source=scripts/lib/receipts.sh
 . ./scripts/lib/receipts.sh
 
-# Buffer the run table and print it in id order at the end: the legs every other leg depends on
-# run first (the self-check, the clean build and the build stamps), then the rest in id order.
+# The self-check and build checks run first. Buffering the rows keeps the final table in ID order.
 RL_SORT_ROWS=1
 
 # The scratch directory holding every leg's captured output, removed on a trap.
@@ -35,7 +34,7 @@ WORK=""
 # Where the build puts every gate binary.
 BIN=build/bin
 
-# The skip tags --expect-skips declared, comma separated. A leg carrying one of them may skip.
+# The comma-separated tags allowed to skip. An empty list permits any tagged leg to skip.
 expect_skips=""
 
 # 1 when --list was passed.
@@ -53,10 +52,10 @@ skip=0
 # How many legs failed.
 fail=0
 
-# The ids of the legs that skipped, each preceded by a space.
+# The IDs of the legs that skipped, each preceded by a space.
 skipped_legs=""
 
-# The ids of the legs that failed, each preceded by a space.
+# The IDs of the legs that failed, each preceded by a space.
 failed_legs=""
 
 # Every leg's outcome, one newline-terminated `id|result|cases|reason` record per leg.
@@ -71,9 +70,7 @@ self_check_ran_count=0
 # How many of the harness's own controls did not fire, which makes leg L10 fail.
 self_check_dead_count=0
 
-# print_usage prints this file's own header block: every comment line after the shebang, stopping
-# at the first line that is not a comment.
-#
+# print_usage prints the header comments immediately following the shebang.
 # Outputs:
 #   The header comment block on stdout.
 print_usage() {
@@ -86,7 +83,7 @@ print_usage() {
 # Arguments:
 #   $@ - The command line
 # Outputs:
-#   The header block on stdout for --help; a complaint on stderr for anything unrecognised
+#   The header on stdout for --help or an error on stderr for an unrecognised option
 # Returns:
 #   Exits 0 after --help and exits 2 on an unrecognised argument, otherwise 0
 parse_arguments() {
@@ -102,8 +99,8 @@ parse_arguments() {
     done
 }
 
-# The leg registry: one row per leg, as id, skip tag and description. --list, the skip-tag mapping
-# and the final tally all read it, and this script keeps no other list of the legs.
+# Each registry row gives a leg's ID, skip tag and description. The --list output, skip checks
+# and final tally all read this list.
 LEGS=(
   "L1|cccl|the CCCL composition counterexample"
   "L2|coq|section 3.5's operation-class rows, proved of one concrete evaluator"
@@ -114,7 +111,7 @@ LEGS=(
   "L7|lanelang|the differential oracle: linear join vs exhaustive path enumeration"
   "L8|lanelang|metamorphic properties of the checker"
   "L9|coq|the mechanised metatheory, and the axioms its theorems rest on"
-  "L10|-|the harness catches its own breaks: undeclared skip, zero assertions, printing stub"
+  "L10|-|the harness checks receipts, counts, skip policy and clean-build failure"
   "L11|-|clean build"
   "L12|-|every gate binary is freshly built and carries a build stamp"
 )
@@ -123,7 +120,7 @@ LEGS=(
 # Globals:
 #   LEGS - Read
 # Arguments:
-#   $1 - The leg id
+#   $1 - The leg ID
 # Outputs:
 #   The tag on stdout
 leg_tag() {
@@ -170,11 +167,11 @@ print_leg_table() {
 # Globals:
 #   rows - Appended with the leg's record
 #   pass, skip, fail - One of them incremented
-#   skipped_legs, failed_legs - Appended with the id where it applies
+#   skipped_legs, failed_legs - Appended with the ID where it applies
 # Arguments:
-#   $1 - The leg id
+#   $1 - The leg ID
 #   $2 - PASS, SKIP or anything else, which counts as a failure
-#   $3 - How many cases the leg asserted
+#   $3 - The case count reported for the leg
 #   $4 - The reason token
 record() {
     local id="$1" result="$2" cases="$3" reason="$4"
@@ -186,15 +183,13 @@ record() {
     esac
 }
 
-# leg_row prints one run-table row and records it, the two acts every leg ends on. A leg whose
-# printed reason differs from its recorded one (run_leg's declined suffix, L12's detail string)
-# calls the two halves itself.
+# leg_row adds a row to the run table and records the same reason in the tally.
 # Globals:
 #   rows and the tallies - Updated through record
 # Arguments:
-#   $1 - The leg id
+#   $1 - The leg ID
 #   $2 - PASS, SKIP or anything else, which counts as a failure
-#   $3 - How many cases the leg asserted
+#   $3 - The case count reported for the leg
 #   $4 - The reason token
 leg_row() {
     rl_report_row "$1" "$2" "$3" "$4"
@@ -214,51 +209,54 @@ result_for_exit_code() {
     esac
 }
 
-# stub_reason names the way a gate that reported a PASS asserted nothing, or prints nothing when it
-# did assert.
+# receipt_error prints a reason if the receipt cannot substantiate the recorded outcome.
 # Arguments:
-#   $1 - The last RL-STATUS line the gate printed, empty when it printed none
-#   $2 - The case count read from that line
-# Outputs:
-#   no-status-line, zero-assertions, or nothing
-stub_reason() {
-    local why
-    if [ -z "$1" ]; then
-        why="no-status-line"
-    elif [ "$2" -eq 0 ]; then
-        why="zero-assertions"
-    else
-        return 0
+#   $1..$3 - The RL-STATUS lines, expected leg ID and outcome implied by the exit code
+#   $4..$6 - The case count, declined count and reason from that line
+receipt_error() {
+    if [[ -z $1 ]]; then
+        printf 'no-status-line'
+    elif [[ $1 == *$'\n'* ]]; then
+        printf 'multiple-status-lines'
+    elif [[ $(rl_status_field leg <<<"$1") != "$2" ]]; then
+        printf 'receipt-leg-mismatch'
+    elif [[ $(rl_status_field result <<<"$1") != "$3" ]]; then
+        printf 'receipt-result-mismatch'
+    elif [[ ! $4 =~ ^[0-9]+$ || ! $5 =~ ^[0-9]+$ || -z $6 ]]; then
+        printf 'malformed-receipt'
+    elif [[ $3 == PASS && $4 =~ ^0+$ ]]; then
+        printf 'zero-assertions'
     fi
-    printf '%s' "$why"
 }
 
-# run_leg runs a gate binary and records the outcome its exit code and status line report.
+# run_leg runs a gate command, checks its receipt against its exit code and records the outcome.
 # Globals:
-#   WORK, BIN - Read
+#   WORK - Read
 #   rows and the tallies - Updated through record
 # Arguments:
-#   $1 - The leg id
+#   $1 - The leg ID
 #   $2.. - The command and its arguments
 # Outputs:
 #   One run-table row, and up to eight lines of captured stderr when the leg failed
 run_leg() {
     local id="$1"; shift
     local out="$WORK/$id.out" err="$WORK/$id.err"
-    local status_code line result cases reason declined_count stub
+    local status_code line result cases reason declined_count error
     "$@" >"$out" 2>"$err"
     status_code=$?
-    line="$(grep -E '^RL-STATUS ' "$out" | tail -1)"
+    line="$(grep -E '^RL-STATUS([[:space:]]|$)' "$out")"
     cases="$(rl_status_field cases <<<"$line")"
     declined_count="$(rl_status_field skipped <<<"$line")"
     reason="$(rl_status_field reason <<<"$line")"
-    : "${cases:=0}"; : "${declined_count:=0}"; : "${reason:=no-status-line}"
     result="$(result_for_exit_code "$status_code")"
-    if [ "$result" = PASS ]; then
-        stub="$(stub_reason "$line" "$cases")"
-        [ -n "$stub" ] && { result=FAIL; reason="$stub"; }
+    error="$(receipt_error "$line" "$id" "$result" "$cases" "$declined_count" "$reason")"
+    if [ -n "$error" ]; then
+        result=FAIL
+        reason="$error"
+        cases=0
+        declined_count=0
     fi
-    if [ "$declined_count" -gt 0 ]; then
+    if [[ ! $declined_count =~ ^0+$ ]]; then
         rl_report_row "$id" "$result" "$cases" "$reason ($declined_count case(s) declined)"
     else
         rl_report_row "$id" "$result" "$cases" "$reason"
@@ -267,7 +265,7 @@ run_leg() {
     record "$id" "$result" "$cases" "$reason"
 }
 
-# control_report_drift asserts CR1: the registry names the controls the script reports on.
+# control_report_drift compares the registry with the literal IDs in the script's report calls.
 # Arguments:
 #   $1 - The registry rows, one per line
 #   $2 - Path to controls.sh
@@ -286,17 +284,16 @@ control_report_drift() {
     printf '%s' "$out"
 }
 
-# control_ids_in prints the control ids a document's control-table rows name, space separated.
+# control_ids_in prints the control IDs a document's control-table rows name, space separated.
 # Arguments:
 #   $1 - Path to the document
 # Outputs:
-#   The ids on stdout, sorted and separated by single spaces
+#   The IDs on stdout, sorted and separated by single spaces
 control_ids_in() {
     grep -oE '^\| CC[0-9]+ ' "$1" 2>/dev/null | grep -oE 'CC[0-9]+' | sort -u | tr '\n' ' '
 }
 
-# control_map_drift asserts CR2: every control the registry defines has a row in the reviewer's
-# map, and every row names a control that exists.
+# control_map_drift checks that the registry and the reviewer's map list the same controls (CR2).
 # Arguments:
 #   $1 - The registry rows, one per line
 #   $2 - Path to the reviewer's map
@@ -315,7 +312,8 @@ control_map_drift() {
     printf '%s' "$out"
 }
 
-# control_roster_drift prints every disagreement about which controls exist, or nothing.
+# control_roster_drift checks the registry's size and IDs against the report calls and the map
+# when both files are present.
 # Outputs:
 #   One entry per disagreement on stdout, each preceded by a space
 control_roster_drift() {
@@ -340,7 +338,7 @@ control_roster_drift() {
 
 # count_outside_range reports whether an observed count falls outside a stated expectation.
 # Arguments:
-#   $1 - The expectation: a plain integer, or `low-high`
+#   $1 - The expected count as an integer or a `low-high` range
 #   $2 - The count the leg reported
 # Returns:
 #   0 when the count is outside the expectation, 1 when it satisfies it
@@ -356,7 +354,7 @@ count_outside_range() {
 # ledger_expected_count prints the count ARTIFACT.md's row for one leg states.
 # Arguments:
 #   $1 - Path to the reviewer's map
-#   $2 - The leg id
+#   $2 - The leg ID
 # Outputs:
 #   The stated count on stdout, or nothing when the row states none
 ledger_expected_count() {
@@ -367,7 +365,7 @@ ledger_expected_count() {
 # Arguments:
 #   $1 - Path to the reviewer's map
 # Outputs:
-#   One id per row stating no count, each preceded by a space
+#   One ID per row stating no count, each preceded by a space
 ledger_rows_without_counts() {
     local id out=""
     for id in $(grep -oE '^\| L[0-9]+ ' "$1" | tr -d '| '); do
@@ -376,17 +374,27 @@ ledger_rows_without_counts() {
     printf '%s' "$out"
 }
 
-# ledger_count_drift prints every leg where the count ARTIFACT.md states is not the count the leg
-# reported, or nothing.
+# ledger_count_drift checks the map's row count, that the registry and the map name the same
+# legs, and flags rows without a case count. For legs that passed, it compares the observed
+# count with any stated number or range.
 # Globals:
+#   LEGS - Read
 #   rows - Read
 # Outputs:
-#   One `id(map=W,ran=R)` per drifted row on stdout, each preceded by a space
+#   Any row or count discrepancies on stdout when the map exists
 ledger_count_drift() {
-    local map=ARTIFACT.md id result cases reason want out="" row_count missing
+    local map=ARTIFACT.md id result cases reason want out="" row_count missing defined rowed leg
     [ -f "$map" ] || return 0
     row_count="$(grep -cE '^\| L[0-9]' "$map")"
     out="$(rl_floor_shortfall 'ARTIFACT.md leg rows' "$row_count" 12)"
+    defined="$(printf '%s\n' "${LEGS[@]}" | cut -d'|' -f1 | tr '\n' ' ')"
+    rowed="$(grep -oE '^\| L[0-9]+ ' "$map" | tr -d '| ' | tr '\n' ' ')"
+    for leg in $defined; do
+        rl_in_set "$leg" "$rowed" || out="$out $leg(defined,no-row)"
+    done
+    for leg in $rowed; do
+        rl_in_set "$leg" "$defined" || out="$out $leg(row,not-defined)"
+    done
     missing="$(ledger_rows_without_counts "$map")"
     [ -n "$missing" ] && out="$out${missing// / no-count:}"
     while IFS='|' read -r id result cases reason; do
@@ -401,7 +409,8 @@ ledger_count_drift() {
     printf '%s' "$out"
 }
 
-# undeclared_skips prints the skips so far that --expect-skips did not declare, or nothing.
+# undeclared_skips reports skipped legs marked as never skipping. With a non-empty list of
+# expected tags, it also reports skipped legs whose tags are absent from the list.
 # Globals:
 #   skipped_legs, expect_skips - Read
 # Outputs:
@@ -420,7 +429,7 @@ undeclared_skips() {
     printf '%s' "$out"
 }
 
-# write_self_check_stubs writes the three synthetic gates the harness has to catch.
+# write_self_check_stubs writes three synthetic gates and a make command that fails to clean.
 # Globals:
 #   WORK - Read
 write_self_check_stubs() {
@@ -443,7 +452,11 @@ echo ""
 echo "89 assertions, 0 failed"
 exit 0
 STUB
-    chmod +x "$WORK/sc1" "$WORK/sc2" "$WORK/sc3"
+    cat >"$WORK/make-stub" <<'STUB'
+#!/bin/sh
+[ "$1" = all ]
+STUB
+    chmod +x "$WORK/sc1" "$WORK/sc2" "$WORK/sc3" "$WORK/make-stub"
 }
 
 # register_self_check_stubs gives the stubs registry rows and a declaration that omits SC1's tag.
@@ -453,6 +466,9 @@ register_self_check_stubs() {
     LEGS+=("SC1|selfcheck|a gate that skips with an undeclared tag")
     LEGS+=("SC2|-|a gate that exits 0 having asserted nothing")
     LEGS+=("SC3|-|a stub that prints a convincing transcript and no status line")
+    LEGS+=("SC5|-|a gate reporting another leg's receipt")
+    LEGS+=("SC6|-|a gate reporting failure but exiting successfully")
+    LEGS+=("SC7|-|a gate issuing two contradictory receipts")
     expect_skips="absent-tag"
 }
 
@@ -461,7 +477,7 @@ register_self_check_stubs() {
 #   rows - Read
 #   self_check_ran_count, self_check_dead_count - Updated
 # Arguments:
-#   $1 - The stub's leg id
+#   $1 - The stub's leg ID
 #   $2 - The result it has to have been recorded with
 #   $3 - A substring its recorded reason has to contain
 # Outputs:
@@ -480,26 +496,36 @@ expect_leg_outcome() {
     fi
 }
 
-# check_stub_classification asserts SC1 to SC3: the three stubs go through the real run_leg and
-# each is classified the way the protocol requires.
+# check_stub_classification runs the receipt checks on synthetic gates and runs L11 with
+# a make command whose clean target fails.
 # Globals:
 #   WORK - Read
 # Outputs:
-#   Three rows of the self-check table
+#   One row per stub
 check_stub_classification() {
+    local -a lanelang_make=("$WORK/make-stub")
     run_leg SC1 "$WORK/sc1" >/dev/null 2>&1
     run_leg SC2 "$WORK/sc2" >/dev/null 2>&1
     run_leg SC3 "$WORK/sc3" >/dev/null 2>&1
+    run_leg SC5 printf '%s\n' 'RL-STATUS leg=L4 result=PASS cases=1 skipped=0 reason=-' >/dev/null
+    run_leg SC6 printf '%s\n' 'RL-STATUS leg=SC6 result=FAIL cases=1 skipped=0 reason=-' >/dev/null
+    run_leg SC7 printf '%s\n' 'RL-STATUS leg=SC7 result=FAIL cases=1 skipped=0 reason=broken' \
+        'RL-STATUS leg=SC7 result=PASS cases=1 skipped=0 reason=-' >/dev/null
     expect_leg_outcome SC1 SKIP forced-skip
     expect_leg_outcome SC2 FAIL zero-assertions
     expect_leg_outcome SC3 FAIL no-status-line
+    expect_leg_outcome SC5 FAIL receipt-leg-mismatch
+    expect_leg_outcome SC6 FAIL receipt-result-mismatch
+    expect_leg_outcome SC7 FAIL multiple-status-lines
+    run_clean_build_leg >/dev/null
+    expect_leg_outcome L11 FAIL clean-failed
 }
 
 # expect_drift_reported asserts that a drift function named the perturbation it was given.
 # Globals:
 #   self_check_ran_count, self_check_dead_count - Updated
 # Arguments:
-#   $1 - The control id
+#   $1 - The control ID
 #   $2 - What the control perturbed
 #   $3 - The substring the function's output has to contain
 #   $4 - What the function actually printed
@@ -514,8 +540,8 @@ expect_drift_reported() {
     esac
 }
 
-# check_count_drift_rule asserts SC4: a leg whose observed count is not the count ARTIFACT.md
-# states is named by ledger_count_drift.
+# check_count_drift_rule checks that ledger_count_drift names a leg whose count differs from
+# the count in ARTIFACT.md (SC4).
 # Globals:
 #   rows - Read and restored
 #   self_check_ran_count, self_check_dead_count - Updated
@@ -551,11 +577,11 @@ check_undeclared_skip_rule() {
 # Outputs:
 #   The verdict and one RL-STATUS line on stdout
 # Returns:
-#   Exits 0 when every control fired, 1 otherwise
+#   Exits 0 when at least nine controls ran and every one fired, 1 otherwise
 print_self_check_verdict() {
     echo "------------------------------------------------------------"
-    if [ "$self_check_ran_count" -lt 5 ]; then
-        echo "FAILURE: only $self_check_ran_count harness control(s) ran, and there are at least 5. Something"
+    if [ "$self_check_ran_count" -lt 9 ]; then
+        echo "FAILURE: only $self_check_ran_count harness control(s) ran, and there are at least 9. Something"
         echo "         stopped them being reached, so this leg is not evidence of anything."
         echo "RL-STATUS leg=L10 result=FAIL cases=$self_check_ran_count skipped=0 reason=harness-self-check-degenerate"
         exit 1
@@ -573,7 +599,8 @@ print_self_check_verdict() {
 
 # run_self_check runs the harness's own must-fail controls and exits.
 # Globals:
-#   WORK, LEGS, expect_skips, rows - Read and written by the controls below
+#   WORK - Read
+#   LEGS, expect_skips, rows and the tallies - Updated by the controls
 # Returns:
 #   Exits through print_self_check_verdict
 run_self_check() {
@@ -597,20 +624,25 @@ build_make_commands() {
     return 0
 }
 
-# run_clean_build_leg runs leg L11: the tree is cleaned and rebuilt before any gate runs.
+# run_clean_build_leg runs the checker's clean target before rebuilding it for L11.
 # Globals:
 #   WORK, lanelang_make - Read
 #   rows and the tallies - Updated through record
 # Outputs:
-#   One run-table row, and the last fifteen lines of the build log when it failed
+#   One run-table row and up to fifteen lines from the failed target's log
+# Returns:
+#   0 when both targets succeeded, 1 otherwise
 run_clean_build_leg() {
-    "${lanelang_make[@]}" clean >/dev/null 2>&1
-    if "${lanelang_make[@]}" all >"$WORK/build.log" 2>&1; then
-        leg_row L11 PASS 1 built
-    else
+    if ! "${lanelang_make[@]}" clean >"$WORK/build.log" 2>&1; then
+        leg_row L11 FAIL 0 clean-failed
+    elif ! "${lanelang_make[@]}" all >"$WORK/build.log" 2>&1; then
         leg_row L11 FAIL 0 build-failed
-        tail -15 "$WORK/build.log" | sed 's/^/      /'
+    else
+        leg_row L11 PASS 1 built
+        return 0
     fi
+    tail -15 "$WORK/build.log" | sed 's/^/      /'
+    return 1
 }
 
 # read_all_target_binaries prints the binaries a Makefile's `all:` target builds, one per line.
@@ -629,7 +661,8 @@ read_all_target_binaries() {
           done
 }
 
-# gate_binary_defect prints why one gate binary cannot be trusted, or nothing when it is sound.
+# gate_binary_defect checks that the gate is executable and prints a compiler stamp and a clean
+# control stamp under its own name.
 # Globals:
 #   WORK, BIN - Read
 # Arguments:
@@ -656,7 +689,7 @@ make_targets_out_of_date() {
     "${lanelang_make[@]}" -q all >/dev/null 2>&1 || printf ' lanelang-out-of-date-after-build'
 }
 
-# report_build_stamp_leg prints and records leg L12.
+# report_build_stamp_leg adds L12 to the run table and records its outcome.
 # Globals:
 #   rows and the tallies - Updated through record
 # Arguments:
@@ -674,7 +707,7 @@ report_build_stamp_leg() {
     fi
 }
 
-# surviving_control_binaries prints every binary in the build directory carrying a control macro.
+# surviving_control_binaries lists executables that print a control stamp without a clean stamp.
 # Globals:
 #   WORK, BIN - Read
 # Outputs:
@@ -692,8 +725,8 @@ surviving_control_binaries() {
     printf '%s' "$out"
 }
 
-# run_build_stamp_leg runs leg L12: every gate binary exists, is current with respect to the
-# sources it is built from, and no binary in the build directory carries a control macro.
+# run_build_stamp_leg checks the gate binaries' stamps and looks for control stamps in the build
+# directory. If those checks pass, it asks make whether the all target is up to date.
 # Globals:
 #   rows and the tallies - Updated through report_build_stamp_leg
 # Outputs:
@@ -715,18 +748,19 @@ run_build_stamp_leg() {
     report_build_stamp_leg "$stale" "$stamped"
 }
 
-# run_build_legs runs the legs that have to hold before any gate binary can be believed: the
-# harness's own controls, the clean build, and the build stamps.
+# run_build_legs runs the harness controls, clean build and build stamp checks in dependency order.
 # Globals:
 #   rows and the tallies - Updated through the legs
 run_build_legs() {
     run_leg L10 ./reproduce.sh --self-check
-    run_clean_build_leg
-    run_build_stamp_leg
+    if run_clean_build_leg; then
+        run_build_stamp_leg
+    else
+        leg_row L12 FAIL 0 clean-build-failed
+    fi
 }
 
-# run_oracle_legs runs legs L6, L7 and L8: the oracle over programs the front end parsed, the
-# differential oracle, and the metamorphic properties.
+# run_oracle_legs runs the round-trip, differential and metamorphic checks for L6, L7 and L8.
 # Globals:
 #   BIN - Read
 #   rows and the tallies - Updated through the legs
@@ -742,22 +776,19 @@ run_oracle_legs() {
     fi
 }
 
-# run_schedule_leg runs leg L4: the claim about what a compiler may do to a pinned value,
-# executed.
+# run_schedule_leg checks whether pinned values keep their bits across schedules for L4.
 # Globals:
 #   BIN - Read
 run_schedule_leg() {
     run_leg L4 "$BIN/test_schedule"
 }
 
-# run_checker_legs runs legs L2 to L9 in id order: the operation-class proofs, the fixtures, the
-# schedule invariance, the blessing receipt, the oracle family and the mechanised metatheory.
+# run_checker_legs runs the proof, fixture, schedule, blessing and oracle checks in leg order.
 # Globals:
 #   WORK, BIN, lanelang_make - Read
 #   rows and the tallies - Updated through the legs
 # Outputs:
-#   One run-table row per leg, and the last ten lines of the build log when the checker failed to
-#   build
+#   A row for each leg run and up to ten lines of the build log if the checker failed to build
 run_checker_legs() {
     run_leg L2 ./scripts/check-proofs-eval.sh
     if "${lanelang_make[@]}" all >"$WORK/ll.log" 2>&1; then
@@ -772,7 +803,7 @@ run_checker_legs() {
     run_leg L9 ./scripts/check-proofs.sh
 }
 
-# run_cccl_leg runs leg L1: the CCCL composition counterexample, where it is built.
+# run_cccl_leg runs the CCCL composition counterexample for L1 when its script is available.
 # Globals:
 #   rows and the tallies - Updated through the leg
 run_cccl_leg() {
@@ -783,7 +814,7 @@ run_cccl_leg() {
     fi
 }
 
-# run_experiment_legs runs the one check that leaves the tree: the CCCL counterexample.
+# run_experiment_legs runs the CCCL experiment.
 # Globals:
 #   rows and the tallies - Updated through the leg
 run_experiment_legs() {
@@ -817,7 +848,7 @@ verdict_registry_complete() {
 # verdict_control_roster asserts that controls.sh and the reviewer's map agree about which controls
 # exist.
 # Outputs:
-#   Three lines naming the disagreements
+#   A failure message describing any registry or map discrepancies
 # Returns:
 #   0 when the rosters agree, 1 otherwise
 verdict_control_roster() {
@@ -830,11 +861,11 @@ verdict_control_roster() {
     return 1
 }
 
-# verdict_ledger_counts asserts that ARTIFACT.md states the counts this run observed.
+# verdict_ledger_counts reports any map or count discrepancies found by ledger_count_drift.
 # Outputs:
 #   Four lines naming the drifted rows
 # Returns:
-#   0 when every comparable row matched, 1 otherwise
+#   0 when ledger_count_drift reported no discrepancies, 1 otherwise
 verdict_ledger_counts() {
     local drift
     drift="$(ledger_count_drift)"
@@ -846,12 +877,11 @@ verdict_ledger_counts() {
     return 1
 }
 
-# verdict_declared_skips asserts that every skip was declared, so that a suite that has silently
-# lost a leg cannot report a clean run.
+# verdict_declared_skips fails the run when undeclared_skips reports a disallowed skip.
 # Outputs:
 #   Up to five lines naming the skips and what could be done about them
 # Returns:
-#   0 when every skip was declared, 1 otherwise
+#   0 when every skip was allowed, 1 otherwise
 verdict_declared_skips() {
     local unexpected
     unexpected="$(undeclared_skips)"
@@ -880,8 +910,8 @@ print_green_line() {
     fi
 }
 
-# print_verdict tabulates the run: what ran, what it emitted, what the documents say about it, and
-# whether every skip was declared.
+# print_verdict checks the reported results against the registry, the documented counts and
+# the declared skips before printing the final tally.
 # Globals:
 #   fail, failed_legs - Read
 # Outputs:
@@ -911,7 +941,7 @@ print_verdict() {
 # Outputs:
 #   The run table and the verdict on stdout
 # Returns:
-#   0 when every leg passed and every skip was declared, 1 otherwise, 2 on a bad argument
+#   0 on success, including allowed skips, 1 on a failed check and 2 on a bad argument
 main() {
     parse_arguments "$@"
     WORK="$(rl_make_work_directory replay-lattice)" || exit 1

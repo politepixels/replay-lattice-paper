@@ -89,7 +89,8 @@ static int build_blessed(const char *blessing, built_program_t *built) {
     (void) heal_program(built->resolved.dag, built->resolved.result);
 
     const int count = dag_count(built->resolved.dag);
-    lane_t *computed = (lane_t *) calloc((size_t) (count > 0 ? count : 1), sizeof(lane_t));
+    const size_t slots = count > 0 ? (size_t) count : 1;
+    lane_t *computed = calloc(slots, sizeof *computed);
     if (!computed) {
         free_program(built);
         return 0;

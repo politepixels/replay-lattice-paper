@@ -56,7 +56,7 @@ diagnostic_t *diagnostic_new(const char *file, const char *source);
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 void diagnostic_free(diagnostic_t *sink);
 
-// diagnostic_error records a one-span error, which is a parse or resolution failure.
+// diagnostic_error records an error at a single source position.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 // Takes at (span_t) which is the source position to blame.
@@ -81,8 +81,8 @@ void diagnostic_error_with_cause(
     ...
 );
 
-// diagnostic_note records a note attached to the error before it. A note is not counted
-// as an error.
+// diagnostic_note records a note at a source position. It can stand alone or add context
+// to an error. Only errors contribute to the error count.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 // Takes at (span_t) which is the source position to blame.
@@ -98,15 +98,9 @@ int diagnostic_error_count(const diagnostic_t *sink);
 // diagnostic_mark records how much the sink holds, and diagnostic_rewind discards
 // everything recorded since a mark. A NULL sink marks at 0 and rewinds to nothing.
 //
-// The pair exists only for speculative reads. In a build that leaves the lane qualifiers
-// unreserved, the parser tells a qualifier from a name by one token of lookahead with a
-// save-and-restore of its own cursor, and restoring the cursor alone puts the tokens back
-// but not the diagnostics: a lexer error inside the lookahead is recorded once there and
-// once again when the caller re-reads the same character, so a program with one bad byte
-// reports it twice. The cursor and the sink
-// rewind together or neither does. Rewinding past a mark taken before an error the caller
-// means to keep would discard it, so a mark is taken and used in one place, immediately
-// around the speculative read.
+// The unreserved control build looks ahead to distinguish a qualifier from a name. If the
+// parser restores its cursor after that read, it also rewinds the sink. Otherwise a bad
+// byte seen during lookahead would be reported again when the parser rereads it.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
 // Returns how many entries the sink holds.
@@ -131,14 +125,14 @@ void diagnostic_render(const diagnostic_t *sink, void *stream);
 // diagnostic_first_spans reports the spans of the first recorded error, for the fixture
 // runner's EXPECT lines.
 //
-// Writes the demand site through `primary`, the site that lost the guarantee through
-// `secondary`, and the distance between them through `hops`; any of the three may be
-// NULL. Returns 1 when an error was found and 0 when the sink holds none.
+// For a two-span lane error, the spans locate the demand and its cause. A single-span
+// error has SPAN_NONE for its cause and a hop count of zero. Any output may be NULL.
+// Returns 1 when an error was found and 0 when the sink holds none.
 //
 // Takes sink (diagnostic_t) which is where diagnostics are collected.
-// Takes primary (span_t) which receives the demand site.
-// Takes secondary (span_t) which receives the span that lost the guarantee.
-// Takes hops (int) which receives the hop count between the two.
+// Takes primary (span_t) which receives the location of the error.
+// Takes secondary (span_t) which receives the location of its cause, if present.
+// Takes hops (int) which receives the distance along the blame path.
 int diagnostic_first_spans(const diagnostic_t *sink, span_t *primary, span_t *secondary, int *hops);
 
 // diagnostic_message_contains reports whether any message in the sink holds `needle`.

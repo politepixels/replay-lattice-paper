@@ -14,10 +14,12 @@
 
 #include "eval.h"
 #include "heal.h"
+#include "kernels.h"
 #include "parse.h"
 #include "resolve.h"
 #include "status.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,21 +41,23 @@
 
 static const int WORKERS[] = { 1, 2, 3, 8 };
 
-static const char *const PROGRAMS[] = {
+static const char SUM_INDICES_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
     "    x := indices(count: 5000.0)\n"
     "    %stotal := sum(x)\n"
     "    return total\n"
-    "}\n",
+    "}\n";
 
+static const char SUM_SCALED_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
     "    x := indices(count: 5000.0)\n"
     "    %stotal := sum(x * 0.5)\n"
     "    return total\n"
-    "}\n",
+    "}\n";
 
+static const char SUM_SQUARED_DIFFERENCE_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
     "    x := indices(count: 4096.0)\n"
@@ -61,30 +65,40 @@ static const char *const PROGRAMS[] = {
     "    z := y - x\n"
     "    %stotal := sum(z * z)\n"
     "    return total\n"
-    "}\n",
+    "}\n";
 
+static const char SUM_SHIFTED_PRODUCT_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
     "    x := indices(count: 999.0)\n"
     "    %stotal := sum((x + x) * (x - 0.25))\n"
     "    return total\n"
-    "}\n",
+    "}\n";
 
+static const char SUM_SCAN_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
     "    x := indices(count: 1500.0)\n"
     "    %stotal := sum(scan(x))\n"
     "    return total\n"
-    "}\n",
+    "}\n";
 
+static const char SUM_SCAN_DIFFERENCE_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
     "    x := indices(count: 700.0)\n"
     "    p := scan(x * 0.5)\n"
     "    %stotal := sum(p - x)\n"
     "    return total\n"
-    "}\n",
+    "}\n";
 
+static const char *const PROGRAMS[] = {
+    SUM_INDICES_PROGRAM,
+    SUM_SCALED_PROGRAM,
+    SUM_SQUARED_DIFFERENCE_PROGRAM,
+    SUM_SHIFTED_PRODUCT_PROGRAM,
+    SUM_SCAN_PROGRAM,
+    SUM_SCAN_DIFFERENCE_PROGRAM,
 };
 
 #define NP ((int) (sizeof PROGRAMS / sizeof PROGRAMS[0]))
@@ -539,55 +553,40 @@ static void check_integer_domain(run_state_t *state) {
     }
 }
 
-static void check_reference(run_state_t *state) {
-    static const struct { const char *name; const char *program; } CASES[] = {
-        { "exact/int",   INTEGER_PROGRAM },
-        { "exact/float", EXACT_FLOAT_PROGRAM }
-    };
+static void check_reference(const char *name, const char *program, run_state_t *state) {
+    double reference = 0.0;
+    state->cases++;
+    if (!eval_reference(program, &reference)) {
+        printf("FAIL    %-13s did not evaluate against the reference\n", name);
+        state->failed++;
+        note_failure(state, "schedule-eval-failed");
+        return;
+    }
 
-    for (size_t c = 0; c < sizeof CASES / sizeof CASES[0]; c++) {
-        double reference = 0.0;
-        state->cases++;
-        if (!eval_reference(CASES[c].program, &reference)) {
-            printf("FAIL    %-13s did not evaluate against the reference\n", CASES[c].name);
-            state->failed++;
-            note_failure(state, "schedule-eval-failed");
-            continue;
-        }
-
-        int moved = 0;
-        for (int t = 0; t < NT && !moved; t++) {
-            for (int w = 0; w < NW && !moved; w++) {
-                double got = 0.0;
-                size_t columns = 0, tiles = 0;
-                state->cases++;
-                if (!eval_one(CASES[c].program, "",
-                              (schedule_point_t) {TRAV[t].mode, TRAV[t].tile, WORKERS[w]},
-                              &got, &columns, &tiles)) {
-                    printf("FAIL    %-13s did not evaluate at traversal %d workers %d\n",
-                           CASES[c].name, t, WORKERS[w]);
-                    state->failed++;
-                    note_failure(state, "schedule-eval-failed");
-                    moved = 1;
-                    break;
-                }
-                if (memcmp(&got, &reference, sizeof got) != 0) {
-                    printf("FAIL    %-13s traversal %d workers %d gives 0x%016llx, the serial "
-                           "reference gives 0x%016llx; an `exact` value is not the reference\n",
-                           CASES[c].name, t, WORKERS[w],
-                           (unsigned long long) bits_of(got),
-                           (unsigned long long) bits_of(reference));
-                    state->failed++;
-                    note_failure(state, "exact-value-not-reference-equal");
-                    moved = 1;
-                }
+    for (int t = 0; t < NT; t++) {
+        for (int w = 0; w < NW; w++) {
+            const schedule_point_t schedule = {TRAV[t].mode, TRAV[t].tile, WORKERS[w]};
+            double got = 0.0;
+            state->cases++;
+            if (!eval_one(program, "", schedule, &got, NULL, NULL)) {
+                printf("FAIL    %-13s did not evaluate at traversal %d workers %d\n", name, t, WORKERS[w]);
+                state->failed++;
+                note_failure(state, "schedule-eval-failed");
+                return;
+            }
+            if (memcmp(&got, &reference, sizeof got) != 0) {
+                printf("FAIL    %-13s traversal %d workers %d gives 0x%016llx, the serial "
+                       "reference gives 0x%016llx; an `exact` value is not the reference\n",
+                       name, t, WORKERS[w], (unsigned long long) bits_of(got),
+                       (unsigned long long) bits_of(reference));
+                state->failed++;
+                note_failure(state, "exact-value-not-reference-equal");
+                return;
             }
         }
-        if (!moved) {
-            printf("  ok    %-13s equals the serial reference 0x%016llx over all %d cells\n",
-                   CASES[c].name, (unsigned long long) bits_of(reference), NT * NW);
-        }
     }
+    printf("  ok    %-13s equals the serial reference 0x%016llx over all %d cells\n",
+           name, (unsigned long long) bits_of(reference), NT * NW);
 }
 
 static const char ITERATE_PROGRAM[] =
@@ -655,6 +654,36 @@ static const char NESTED_CARRY_PROGRAM[] =
     "    return total\n"
     "}\n";
 
+static const char BACKWARD_CARRY_PROGRAM[] =
+    "package app\n"
+    "func main() exact Float {\n"
+    "    k := 5.0\n"
+    "    total := iterate(times: 3.0, from: 1.0, with: (acc, t) => k) + 100.0\n"
+    "    return total\n"
+    "}\n";
+
+static const char NESTED_INVARIANT_RESULT[] =
+    "package app\n"
+    "func main() exact Float {\n"
+    "    k := 5.0\n"
+    "    return iterate(times: 2.0, from: 1.0, with: (acc, t) =>\n"
+    "        iterate(times: 3.0, from: 0.0, with: (inner, j) => k))\n"
+    "}\n";
+
+static const char NESTED_ACCUMULATED_RESULT[] =
+    "package app\n"
+    "func main() exact Float {\n"
+    "    return iterate(times: 2.0, from: 1.0, with: (acc, t) =>\n"
+    "        iterate(times: 3.0, from: acc, with: (inner, j) => inner + 1.0))\n"
+    "}\n";
+
+static const char READ_COMPLETED_CARRY[] =
+    "package app\n"
+    "func main() exact Float {\n"
+    "    x := iterate(times: 1.0, from: 0.0, with: (a, t) => a + 1.0)\n"
+    "    return x + 1.0\n"
+    "}\n";
+
 static const char CHOOSE_THEN_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
@@ -673,54 +702,45 @@ static const char CHOOSE_ELSE_PROGRAM[] =
     "    return total\n"
     "}\n";
 
-static const char INCIDENT_FLIP_PROGRAM[] =
+static const char INCIDENT_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
-    "    x := indices(count: 100000.0)\n"
+    "    x := indices(count: 339.0)\n"
+    "    %ss := sum(x * 0.5)\n"
+    "    picked := choose(when: s - 1.3078970368951559e-05, then: x * 0.0 + 3.0, else: x * 0.0 + 5.0)\n"
+    "    total := isum(picked)\n"
+    "    return total\n"
+    "}\n";
+
+static const char UNUSED_OUT_OF_RANGE_FOLD_PROGRAM[] =
+    "package app\n"
+    "func main() exact Float {\n"
+    "    x := indices(count: 339.0)\n"
     "    approx s := sum(x * 0.5)\n"
-    "    picked := choose(when: s - 0.0042511812704049134, then: x * 0.0 + 3.0, else: x * 0.0 + 5.0)\n"
-    "    total := isum(picked)\n"
-    "    return total\n"
-    "}\n";
-
-static const char INCIDENT_REPLAY_PROGRAM[] =
-    "package app\n"
-    "func main() Float {\n"
-    "    x := indices(count: 100000.0)\n"
-    "    replay s := sum(x * 0.5)\n"
-    "    picked := choose(when: s - 0.0042511812704049134, then: x * 0.0 + 3.0, else: x * 0.0 + 5.0)\n"
-    "    total := isum(picked)\n"
-    "    return total\n"
-    "}\n";
-
-static const char INCIDENT_EXACT_PROGRAM[] =
-    "package app\n"
-    "func main() Float {\n"
-    "    x := indices(count: 100000.0)\n"
-    "    exact s := sum(x * 0.5)\n"
-    "    picked := choose(when: s - 0.0042511812704049134, then: x * 0.0 + 3.0, else: x * 0.0 + 5.0)\n"
-    "    total := isum(picked)\n"
-    "    return total\n"
+    "    v := choose(when: s - 1.3078970368951559e-05,\n"
+    "                then: x * 0.0 + 9007199254740991.0, else: x * 0.0 + 1.0)\n"
+    "    unused := isum(v)\n"
+    "    return 7.0\n"
     "}\n";
 
 static const char INCIDENT_DRIFT_PROGRAM[] =
     "package app\n"
     "func main() Float {\n"
-    "    x := indices(count: 100000.0)\n"
+    "    x := indices(count: 339.0)\n"
     "    approx s := sum(x * 0.5)\n"
     "    return s\n"
     "}\n";
 
-#define INCIDENT_THEN_TOTAL 300000.0
-#define INCIDENT_ELSE_TOTAL 500000.0
-#define INCIDENT_RECORDED_SUM 0.0042511812704049134
+#define INCIDENT_THEN_TOTAL 1017.0
+#define INCIDENT_ELSE_TOTAL 1695.0
 
 static int first_differing_digit(const double value, const double recorded) {
     char got[32];
     char want[32];
     snprintf(got, sizeof got, "%.16e", value);
     snprintf(want, sizeof want, "%.16e", recorded);
-    if (strcmp(strchr(got, 'e'), strchr(want, 'e')) != 0) {
+    const char *exponent = strchr(got, 'e');
+    if (!exponent || strcmp(exponent, strchr(want, 'e')) != 0) {
         return 1;
     }
     int digit = 0;
@@ -736,39 +756,51 @@ static int first_differing_digit(const double value, const double recorded) {
     return 0;
 }
 
-static void report_incident_drift(void) {
+static void check_incident_drift(run_state_t *state) {
     uint64_t cells[NT * NW];
-    if (evaluate_grid(INCIDENT_DRIFT_PROGRAM, "", cells) < 0) {
-        printf("        drift: the free sum did not evaluate, so nothing is reported\n");
+    state->cases++;
+    if (evaluate_grid(INCIDENT_DRIFT_PROGRAM, "", cells) != NT * NW) {
+        puts("FAIL    incident drift did not evaluate across the grid");
+        state->failed++;
+        note_failure(state, "incident-did-not-run");
         return;
     }
-    const uint64_t recorded = bits_of(INCIDENT_RECORDED_SUM);
-    int kept = 0;
+    const double recorded = 1.3078970368951559e-05;
     int earliest = 0;
-    for (int j = 0; j < NW; j++) {
-        int moved = 0;
-        for (int i = 0; i < NT; i++) {
+    for (int i = 0; i < NT; i++) {
+        for (int j = 0; j < NW; j++) {
             const uint64_t cell = cells[i * NW + j];
-            if (cell == recorded) {
+            if ((cell == bits_of(recorded)) != (WORKERS[j] == 3)) {
+                printf("FAIL    incident drift at %s with %d workers missed the recorded pattern\n",
+                       TRAV[i].name, WORKERS[j]);
+                state->failed++;
+                note_failure(state, "incident-record-moved");
+                return;
+            }
+            if (cell == bits_of(recorded)) {
                 continue;
             }
             double value;
             memcpy(&value, &cell, sizeof value);
-            const int digit = first_differing_digit(value, INCIDENT_RECORDED_SUM);
-            if (earliest == 0 || (digit > 0 && digit < earliest)) {
+            const int digit = first_differing_digit(value, recorded);
+            if (earliest == 0 || digit < earliest) {
                 earliest = digit;
             }
-            moved = 1;
         }
-        kept += !moved;
     }
-    printf("        drift: the free sum keeps the recorded bits at %d of %d worker counts; "
-           "the rest move it first in significant digit %d\n", kept, NW, earliest);
+    if (earliest != 5) {
+        printf("FAIL    the free sum first differed in significant digit %d, expected 5\n", earliest);
+        state->failed++;
+        note_failure(state, "incident-drift-digit");
+        return;
+    }
+    printf("        drift: only 3 workers keep the recorded bits across all traversals; "
+           "the earliest difference is in significant digit %d\n", earliest);
 }
 
 static void check_incident_flip(run_state_t *state) {
     uint64_t cells[NT * NW];
-    const int evaluated = evaluate_grid(INCIDENT_FLIP_PROGRAM, "", cells);
+    const int evaluated = evaluate_grid(INCIDENT_PROGRAM, "approx ", cells);
     state->cases += (evaluated < 0 ? 0 : evaluated) + 1;
     if (evaluated < 0) {
         printf("FAIL    incident: the flip program did not build or evaluate\n");
@@ -788,25 +820,26 @@ static void check_incident_flip(run_state_t *state) {
     const uint64_t else_bits = bits_of(INCIDENT_ELSE_TOTAL);
     state->cases++;
     for (int i = 0; i < NT * NW; i++) {
-        if (cells[i] != then_bits && cells[i] != else_bits) {
-            printf("FAIL    incident: cell %d holds a value that is neither arm\n", i);
+        const int workers = WORKERS[i % NW];
+        if (cells[i] != (workers == 3 ? else_bits : then_bits)) {
+            printf("FAIL    incident at %s with %d workers selected the wrong arm\n",
+                   TRAV[i / NW].name, workers);
             state->failed++;
-            note_failure(state, "incident-arm-unknown");
+            note_failure(state, "incident-arm-mismatch");
             return;
         }
     }
     printf("  ok    incident: both arms over %d cells; the schedule picked the answer\n",
            NT * NW);
-    report_incident_drift();
+    check_incident_drift(state);
 }
 
-static void check_incident_pinned(run_state_t *state, const char *program,
-                                  const char *label) {
+static void check_incident_pinned(run_state_t *state, const char *annotation, const double expected) {
     uint64_t cells[NT * NW];
-    const int evaluated = evaluate_grid(program, "", cells);
+    const int evaluated = evaluate_grid(INCIDENT_PROGRAM, annotation, cells);
     state->cases += (evaluated < 0 ? 0 : evaluated) + 1;
     if (evaluated < 0) {
-        printf("FAIL    %-8s the repaired program did not build or evaluate\n", label);
+        printf("FAIL    %-8s the repaired program did not build or evaluate\n", annotation);
         state->failed++;
         note_failure(state, "incident-did-not-run");
         return;
@@ -814,20 +847,20 @@ static void check_incident_pinned(run_state_t *state, const char *program,
     const int distinct = distinct_in(cells, NT * NW, 1);
     if (distinct != 1) {
         printf("FAIL    %-8s %d pattern(s) over %d cells; the repair moved with the "
-               "schedule\n", label, distinct, NT * NW);
+               "schedule\n", annotation, distinct, NT * NW);
         state->failed++;
         note_failure(state, "incident-repair-moved");
         return;
     }
     state->cases++;
-    printf("  ok    %-8s 1 pattern over %d cells\n", label, NT * NW);
-    if (cells[0] != bits_of(INCIDENT_ELSE_TOTAL)) {
-        printf("FAIL    %-8s the repair's one value is not the arm the serial run takes\n", label);
+    printf("  ok    %-8s 1 pattern over %d cells\n", annotation, NT * NW);
+    if (cells[0] != bits_of(expected)) {
+        printf("FAIL    %-8s the repair returned the wrong arm\n", annotation);
         state->failed++;
-        note_failure(state, "incident-repair-not-serial");
+        note_failure(state, "incident-repair-wrong-arm");
         return;
     }
-    printf("  ok    %-8s and it is the arm the serial run takes\n", label);
+    printf("  ok    %-8s consistently returns %.0f\n", annotation, expected);
 }
 
 static void check_value(run_state_t *state, const char *program, const double want,
@@ -921,6 +954,111 @@ static void check_discrimination_floor(run_state_t *state) {
     }
 }
 
+static const char THREADED_PROGRAM[] =
+    "package app\n"
+    "func main() Float {\n"
+    "    x := integers(count: 1025.0)\n"
+    "    y := x + 0.5\n"
+    "    z := choose(when: x - 1.0, then: y - x, else: y + x)\n"
+    "    return iterate(times: 2.0, from: 1.0, with: (a,t) => {\n"
+    "        replay part := sum(z + a + t)\n"
+    "        return part\n"
+    "    })\n"
+    "}\n";
+
+static void check_threaded_traversals(run_state_t *state) {
+    const long failed_before = state->failed;
+    const double expected = 514.5 + 1025.0 * (514.5 + 1025.0 + 1.0);
+    for (int w = 0; w < NW; w++) {
+        size_t materialised = 0;
+        for (int t = 0; t < NT; t++) {
+            const schedule_point_t schedule = { TRAV[t].mode, TRAV[t].tile, WORKERS[w] };
+            double got = 0.0;
+            size_t columns = 0;
+            size_t tiles = 0;
+            const int ok = eval_one(THREADED_PROGRAM, "", schedule, &got, &columns, &tiles);
+            if (schedule.mode == EVAL_MATERIALISE) {
+                materialised = columns;
+            }
+            state->cases++;
+            if (!ok || bits_of(got) != bits_of(expected) || eval_last_replay_workers() != WORKERS[w]
+                || (schedule.mode != EVAL_MATERIALISE && columns >= materialised)
+                || (schedule.mode == EVAL_TILED) != (tiles > 0)) {
+                printf("FAIL    replay %s at %d workers used %d and returned %.17g\n",
+                       TRAV[t].name, WORKERS[w], eval_last_replay_workers(), got);
+                state->failed++;
+                note_failure(state, "threaded-replay");
+            }
+        }
+    }
+    if (state->failed == failed_before) {
+        printf("  ok    replay used 1, 2, 3 and 8 workers across all %d traversals with identical bits\n", NT);
+    }
+}
+
+static void check_block_answer(run_state_t *state, double *input, const size_t length,
+                               const int workers, const double expected) {
+    size_t lengths[] = {length};
+    double *columns[] = {input};
+    eval_state_t reader = {.lengths = lengths, .columns = columns};
+    const int blocks = (int) ((length + 63) / 64);
+    const int team = blocks == 0 ? 0 : (workers <= 1 ? 1 : (workers < blocks ? workers : blocks));
+    double got = -1.0;
+    state->cases++;
+    if (!fold_replay(&reader, 0, length, workers, &got) || bits_of(got) != bits_of(expected)
+        || reader.replay_workers != team) {
+        printf("FAIL    fixed tree of %zu elements at %d workers gave %.17g (expected %.17g)"
+               " with %d active workers (expected %d)\n", length, workers, got, expected,
+               reader.replay_workers, team);
+        state->failed++;
+        note_failure(state, "fixed-tree-answer");
+    }
+}
+
+static void check_block_boundaries(run_state_t *state) {
+    const size_t lengths[] = {0, 1, 63, 64, 65, 127, 128, 129, 193};
+    double data[193];
+    for (size_t i = 0; i < sizeof data / sizeof *data; i++) {
+        data[i] = 1.0;
+    }
+    for (size_t i = 0; i < sizeof lengths / sizeof *lengths; i++) {
+        check_block_answer(state, data, lengths[i], 8, (double) lengths[i]);
+    }
+    memset(data, 0, sizeof data);
+    data[0] = 0x1p54;
+    data[64] = -0x1p54;
+    data[128] = 1.0;
+    check_block_answer(state, data, 129, 3, 1.0);
+    check_block_answer(state, data, 129, 0, 1.0);
+    data[128] = 0.0;
+    data[65] = 1.0;
+    check_block_answer(state, data, 129, 2, 0.0);
+}
+
+static void check_nan_sums(run_state_t *state) {
+    size_t length = 129;
+    double data[129] = {0};
+    double *column = data;
+    const uint64_t first = UINT64_C(0x7ff8000000000001);
+    const uint64_t second = UINT64_C(0xfff8000000000002);
+    memcpy(&data[1], &first, sizeof first);
+    memcpy(&data[64], &second, sizeof second);
+    check_block_answer(state, data, length, 1, NAN);
+    check_block_answer(state, data, length, 3, NAN);
+
+    eval_state_t reader = {.columns = &column, .lengths = &length, .reference = 1};
+    const double reference = fold_strict(&reader, 0, length);
+    reader.reference = 0;
+    double value = 0.0;
+    state->cases++;
+    if (!fold_exact(&reader, 0, length, &value) || !isnan(reference)
+        || bits_of(value) != bits_of(reference)) {
+        puts("FAIL    exact sum changed the serial reference NaN bits");
+        state->failed++;
+        note_failure(state, "exact-nan");
+    }
+}
+
 int main(void) {
     rl_build_stamp("test_schedule");
     if (strcmp(eval_perturbation(), "-") != 0) {
@@ -941,19 +1079,28 @@ int main(void) {
         state.failed++;
         note_failure(&state, "pinned-coverage-drifted");
     }
-    check_reference(&state);
+    check_reference("exact/int", INTEGER_PROGRAM, &state);
+    check_reference("exact/float", EXACT_FLOAT_PROGRAM, &state);
     check_integer_domain(&state);
     check_recurrence_runs(&state);
     check_scan_witness(&state);
     check_value(&state, TICK_PROGRAM, 6.0, "tick", "tick index");
     check_value(&state, NESTED_TICK_PROGRAM, 12.0, "tick2", "tick index");
     check_value(&state, NESTED_CARRY_PROGRAM, 24.0, "nested", "carried value");
+    check_value(&state, BACKWARD_CARRY_PROGRAM, 105.0, "backward", "carried value");
+    check_value(&state, NESTED_INVARIANT_RESULT, 5.0, "nested constant", "carried value");
+    check_value(&state, NESTED_ACCUMULATED_RESULT, 7.0, "nested increment", "carried value");
+    check_value(&state, READ_COMPLETED_CARRY, 2.0, "completed carry", "result");
+    check_value(&state, UNUSED_OUT_OF_RANGE_FOLD_PROGRAM, 7.0, "unused fold", "result");
     check_value(&state, CHOOSE_THEN_PROGRAM, 12288.0, "choose+", "chosen arm");
     check_value(&state, CHOOSE_ELSE_PROGRAM, 20480.0, "choose-", "chosen arm");
     check_incident_flip(&state);
-    check_value(&state, INCIDENT_REPLAY_PROGRAM, INCIDENT_THEN_TOTAL, "incident+", "chosen arm");
-    check_incident_pinned(&state, INCIDENT_EXACT_PROGRAM, "incident=");
+    check_incident_pinned(&state, "replay ", INCIDENT_THEN_TOTAL);
+    check_incident_pinned(&state, "exact ", INCIDENT_ELSE_TOTAL);
     check_discrimination_floor(&state);
+    check_threaded_traversals(&state);
+    check_block_boundaries(&state);
+    check_nan_sums(&state);
 
     printf("schedule: %ld assertion(s); %d program(s) x %d traversal(s) x %d worker count(s), "
            "%d discriminating; fusion and tiling cannot reach a pinned value\n",

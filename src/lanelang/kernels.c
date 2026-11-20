@@ -14,13 +14,10 @@
 
 #include "kernels.h"
 
-#include <stdlib.h>
+#include "column_sums.h"
 
-// EVAL_BLOCK is the fixed leaf width of the `replay` tree, small so a test program can
-// straddle it. The width is frozen ABI: two implementations agree on a `replay` fold's
-// bits only if they agree on it. A column shorter than one block folds as a single block,
-// which is the serial order.
-#define EVAL_BLOCK 64
+#include <pthread.h>
+#include <stdlib.h>
 
 // CONTROL_TILE_REBRACKETS is 1 under the tile-rebrackets control build and 0 in every
 // other, so the two kernels below test a value rather than carrying an `#ifdef` around a
@@ -69,8 +66,8 @@ static double fold_tiles(eval_state_t *state, const int input, const size_t leng
     return total;
 }
 
-// fold_strict is the oracle order: one serial left-to-right fold over `length` elements
-// of node `input`.
+// fold_strict folds `length` elements of node `input` from left to right. When the
+// materialised fast path produces a NaN, the reference loop supplies the result bits.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node whose column is read.
@@ -79,6 +76,12 @@ double fold_strict(eval_state_t *state, const int input, const size_t length) {
     if (CONTROL_TILE_REBRACKETS && state->tiled) {
         return fold_tiles(state, input, length);
     }
+    if (state->columns[input] && state->lengths[input] == length && !state->reference) {
+        const double sum = column_sum(state->columns[input], length);
+        if (!isnan(sum)) {
+            return sum;
+        }
+    }
     double total = 0.0;
     for (size_t i = 0; i < length; i++) {
         total += eval_element_of(state, input, i);
@@ -86,21 +89,130 @@ double fold_strict(eval_state_t *state, const int input, const size_t length) {
     return total;
 }
 
-// fold_replay is the fixed tree: blocks of EVAL_BLOCK elements by position, each folded
-// strict left to right, and the block results then folded the same way.
+// replay_job_t owns one worker's reader and its range of whole blocks.
+typedef struct {
+    // reader borrows immutable columns and owns the worker's private tiles.
+    eval_state_t reader;
+
+    // input identifies the fold operand.
+    int input;
+
+    // length is the total number of input elements.
+    size_t length;
+
+    // first is the index of the first assigned block.
+    size_t first;
+
+    // end is one past the final assigned block.
+    size_t end;
+
+    // totals holds one sum per block in input order.
+    double *totals;
+
+    // thread is the joinable worker.
+    pthread_t thread;
+
+    // parent identifies the thread which launched the worker.
+    pthread_t parent;
+} replay_job_t;
+
+// replay_blocks sums each assigned block independently in input order.
 //
-// The shape is a function of `length` alone, so the bits do not move with the deployment.
-// It writes the total through `out` and returns 0 when the block array cannot be got,
-// because a serial fallback would silently change the bracketing this kernel exists to
-// pin; the control build makes it report failure unconditionally, a kernel lost after the
-// checker has accepted, and the reference path never calls it, so the reference stays the
-// reference.
+// Takes state (eval_state_t) which supplies the input reader.
+// Takes job (replay_job_t) which describes the range and output slots.
+static void replay_blocks(eval_state_t *state, const replay_job_t *job) {
+    const double *values = state->columns[job->input];
+    if (values && state->lengths[job->input] == job->length) {
+        replay_column_blocks(values, job->length, job->first, job->end, job->totals);
+        return;
+    }
+    for (size_t b = job->first; b < job->end; b++) {
+        const size_t low = b * EVAL_BLOCK;
+        const size_t high = job->length - low < EVAL_BLOCK ? job->length : low + EVAL_BLOCK;
+        double sum = 0.0;
+        for (size_t i = low; i < high; i++) {
+            sum += eval_element_of(state, job->input, i);
+        }
+        job->totals[b] = sum;
+    }
+}
+
+// replay_worker publishes its block totals before the parent joins it.
+//
+// Takes argument (void) which points to its assigned job.
+// Returns the job that completed on a worker thread.
+static void *replay_worker(void *argument) {
+    replay_job_t *job = argument;
+    replay_blocks(&job->reader, job);
+    return pthread_equal(pthread_self(), job->parent) ? NULL : job;
+}
+
+// replay_parallel joins every started worker before releasing its storage.
+//
+// Takes state (eval_state_t) which owns the input.
+// Takes fold (replay_job_t) which describes the complete range.
+// Takes workers (int) which is the number of non-empty ranges.
+// Returns zero on allocation or launch failure.
+//
+// Panics if a started worker cannot be joined and its storage may still be in use.
+//
+// Concurrent workers write disjoint block totals and own their tile caches.
+static int replay_parallel(eval_state_t *state, const replay_job_t *fold, const int workers) {
+    replay_job_t *jobs = calloc((size_t) workers, sizeof *jobs);
+    if (!jobs) {
+        return 0;
+    }
+    size_t first = 0;
+    int prepared = 0;
+    for (; prepared < workers; prepared++) {
+        replay_job_t *job = &jobs[prepared];
+        *job = *fold;
+        job->parent = pthread_self();
+        job->first = first;
+        first += fold->end / (size_t) workers + ((size_t) prepared < fold->end % (size_t) workers);
+        job->end = first;
+        if (!eval_worker_reader(&job->reader, state, job->input)) {
+            break;
+        }
+    }
+    int started = 0;
+    while (prepared == workers && started < workers
+           && pthread_create(&jobs[started].thread, NULL, replay_worker, &jobs[started]) == 0) {
+        started++;
+    }
+    int completed = 0;
+    for (int i = 0; i < started; i++) {
+        void *result = NULL;
+        if (pthread_join(jobs[i].thread, &result) != 0) {
+            abort();
+        }
+        completed += result == &jobs[i];
+        state->tile_elements += jobs[i].reader.tile_elements;
+    }
+    for (int i = 0; i < workers; i++) {
+        eval_release_tiles(&jobs[i].reader);
+    }
+    free(jobs);
+    if (started == workers && state->replay_workers < completed) {
+        state->replay_workers = completed;
+    }
+    return started == workers;
+}
+
+// fold_replay folds blocks of up to EVAL_BLOCK elements from left to right. Workers may
+// compute whole blocks in parallel. Their totals are added in block order and a NaN
+// result is canonicalised.
+//
+// The fixed tree depends only on `length`. Allocation or thread creation failure returns
+// zero. The pinned-eval-breaks control always fails this kernel. The serial reference
+// uses a separate path.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node whose column is read.
 // Takes length (size_t) which is how many elements it holds.
+// Takes workers (int) which selects the requested team size.
 // Takes out (double) which receives the answer.
-int fold_replay(eval_state_t *state, const int input, const size_t length, double *out) {
+int fold_replay(eval_state_t *state, const int input, const size_t length, const int workers, double *out) {
     if (CONTROL_PINNED_EVAL_BREAKS) {
         return 0;
     }
@@ -108,7 +220,7 @@ int fold_replay(eval_state_t *state, const int input, const size_t length, doubl
         *out = fold_tiles(state, input, length);
         return 1;
     }
-    const size_t block_count = (length + EVAL_BLOCK - 1) / EVAL_BLOCK;
+    const size_t block_count = length / EVAL_BLOCK + (length % EVAL_BLOCK != 0);
     if (block_count == 0) {
         *out = 0.0; return 1;
     }
@@ -117,32 +229,29 @@ int fold_replay(eval_state_t *state, const int input, const size_t length, doubl
         return 0;
     }
 
-    for (size_t block = 0; block < block_count; block++) {
-        const size_t low = block * EVAL_BLOCK;
-        size_t high = low + EVAL_BLOCK;
-        if (high > length) {
-            high = length;
+    const replay_job_t fold = {.input = input, .length = length, .end = block_count, .totals = block_results};
+    if (workers <= 1 || block_count == 1) {
+        replay_blocks(state, &fold);
+        if (state->replay_workers == 0) {
+            state->replay_workers = 1;
         }
-        double block_total = 0.0;
-        for (size_t i = low; i < high; i++) {
-            block_total += eval_element_of(state, input, i);
+    } else {
+        const int active = (size_t) workers > block_count ? (int) block_count : workers;
+        if (!replay_parallel(state, &fold, active)) {
+            free(block_results);
+            return 0;
         }
-        block_results[block] = block_total;
     }
-    double total = 0.0;
-    for (size_t block = 0; block < block_count; block++) {
-        total += block_results[block];
-    }
+    *out = replay_column_total(block_results, block_count);
     free(block_results);
-    *out = total;
     return 1;
 }
 
-// fold_free is the free fold: chunk by worker count rather than by a fixed width, and
-// combine the partials in worker order.
+// fold_free divides the input into chunks by worker count and combines the partial sums
+// in worker order. Each chunk uses the same striped grouping across traversals.
 //
-// That is the shape a reduction takes when nobody pinned it, so its bits move when the
-// deployment does. It falls back to fold_strict if the partials cannot be got.
+// Changing the worker count can change the bracketing and the result bits. If the partial
+// sums cannot be allocated, fold_free falls back to fold_strict.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node whose column is read.
@@ -169,11 +278,7 @@ double fold_free(eval_state_t *state, const int input, const size_t length,
         if (high > length) {
             high = length;
         }
-        double partial = 0.0;
-        for (size_t i = low; i < high; i++) {
-            partial += eval_element_of(state, input, i);
-        }
-        partials[worker] = partial;
+        partials[worker] = free_chunk_sum(state, input, low, high);
     }
     double total = 0.0;
     for (int worker = 0; worker < lanes; worker++) {
@@ -184,19 +289,17 @@ double fold_free(eval_state_t *state, const int input, const size_t length,
 }
 
 // EVAL_SCAN_BLOCK is the frozen leaf-block width of the fixed-block scan, in elements.
-// The width is frozen ABI rather than a tuning knob: two implementations agree on a
-// `replay` scan's bits only if they agree on it.
+// Reproducing the scan's bracketing requires the same width on both sides.
 #define EVAL_SCAN_BLOCK 64
 
 #ifdef LANELANG_SCAN_BLOCK_FOLLOWS_WORKERS
-// SCAN_WIDTH_ELEMENTS_PER_WORKER is the perturbed width's scaling, small enough that the test
-// programs straddle several blocks; any value that makes the width follow the worker
-// count breaks the claim equally.
+// SCAN_WIDTH_ELEMENTS_PER_WORKER sets the block width per worker in the control build.
+// The test programs span several blocks, so a change in worker count can change the
+// grouping.
 #define SCAN_WIDTH_ELEMENTS_PER_WORKER 8u
 
-// scan_leaf_width lets the deployment pick the width: the kernel still looks blocked and
-// still writes disjoint output ranges, only the width moves, and that is enough to move
-// the bits.
+// scan_leaf_width makes the block width depend on the worker count in the control build.
+// The output ranges remain disjoint, but changing the grouping can change the bits.
 //
 // Takes workers (int) which is how many workers the schedule uses.
 static size_t scan_leaf_width(const int workers) {
@@ -214,12 +317,11 @@ static size_t scan_leaf_width(const int workers) {
 
 // scan_fixed_block computes a blocked prefix into `out`, block by block.
 //
-// The bits are a function of the data and the length alone: blocks write disjoint output
-// ranges and the base pass runs in one order whatever the worker count, so nothing about
-// the deployment reaches the arithmetic. Each block's prefix is computed from zero and
-// the block's offset is added afterwards; accumulating straight through the boundary
-// would form every partial sum in the same order whatever the width, and the width would
-// reach no bit.
+// Each block computes its local prefixes from zero. Each output adds the totals of the
+// preceding blocks to its local prefix, and the base advances once per block. With the
+// shipped block width, these additions depend only on the input data and length.
+// Accumulating straight through the boundary would erase the effect of changing the width
+// in the control build.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node whose column is read.
@@ -247,8 +349,8 @@ void scan_fixed_block(eval_state_t *state, const int input, double *out, const s
     }
 }
 
-// scan_free is a free scan: chunked by worker count, so the partial bases combine in an
-// order the deployment picks and the low bits move with it.
+// scan_free groups its prefix sums by worker count. Changing the chunk boundaries can
+// change the low bits.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node whose column is read.
@@ -275,13 +377,13 @@ void scan_free(eval_state_t *state, const int input, double *out, const size_t l
     }
 }
 
-// EVAL_EXACT_INTEGER_LIMIT is the largest magnitude at which every integer is exactly
-// representable in a double. An exact-integer fold may be scheduled freely and still earn
-// an `exact` demand because, at or below it, integer addition is `exact` and associative.
+// EVAL_EXACT_INTEGER_LIMIT is the exclusive upper bound on the sum of absolute input
+// values accepted by the integer fold. Below it, every possible partial sum is an exactly
+// representable integer.
 #define EVAL_EXACT_INTEGER_LIMIT 9007199254740992.0
 
-// eval_is_exact_integer reports whether `x` is an integer this fold may accept: finite,
-// integral, and within the range where addition cannot round.
+// eval_is_exact_integer reports whether `x` is integral and has magnitude strictly below
+// EVAL_EXACT_INTEGER_LIMIT.
 //
 // Takes x (double) which is the value tested.
 static int eval_is_exact_integer(const double x) {
@@ -294,11 +396,10 @@ static int eval_is_exact_integer(const double x) {
 // magnitudes beside the sum itself and refusing as soon as an element leaves the range
 // where double addition is `exact`.
 //
-// The guard is on the sum of absolute values, which makes it a property of the data
-// rather than of the schedule: bounding the partial of the chunking this run happened to
-// pick would let the same column refuse at one worker count and answer at another, while
-// the sum of magnitudes is the same number under every bracketing and dominates every
-// partial of every one of them.
+// The sum of absolute values bounds every partial under every bracketing. Checking that
+// bound for the chunks and then for their combined magnitudes makes acceptance depend
+// only on the data. Checking the signed partials of one schedule could accept a column
+// that another schedule refuses.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node holding the column being folded.
@@ -330,13 +431,11 @@ static int fold_integer_chunk(eval_state_t *state, const int input, const size_t
 // fold_integer folds in worker order over `exact` integers, checking the domain as it
 // goes.
 //
-// The claim `exact` is true while the sum of the column's absolute values stays below
-// 2^53 and false beyond it, so the fold enforces the property its class asserts rather
-// than trusting a caller to supply it: a value out of domain, or a column whose
-// magnitudes sum past the range, fails the evaluation rather than returning a rounded
-// answer. The worker count, the chunking and the order partials combine are not pinned,
-// because none of them can move a bit or move the domain answer; a refusal that moved
-// with the worker count would make evaluability a fact about the schedule.
+// Every input must be integral and the sum of absolute values must stay strictly below
+// 2^53. Within this domain any grouping gives the serial result. The guard also rejects
+// some columns whose sums happen to be exact beyond the bound. Because the bound is a
+// property of the input, worker count can change neither the accepted result nor the
+// domain verdict.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node whose column is read.
@@ -395,11 +494,9 @@ int fold_integer(eval_state_t *state, const int input, const size_t length,
 
 // fold_exact discharges an `exact` demand with the serial fold.
 //
-// The control build discharges it with the fixed tree instead. The fixed tree is a valid
-// `replay` kernel and is schedule-invariant, but it is not the serial reference for
-// floating point, so that build is one in which a single lane has two bit patterns
-// depending on which kernel discharged it; every schedule-axis assertion still passes
-// under it, and only the reference comparison notices.
+// The exact-lowers-to-tree control substitutes the fixed tree. Its results repeat across
+// schedules, but for some floating-point inputs they differ from the serial result. The
+// reference comparison detects this even when the schedule comparisons all agree.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes input (int) which is the node holding the column being folded.
@@ -408,7 +505,7 @@ int fold_integer(eval_state_t *state, const int input, const size_t length,
 // Returns 1, or 0 when the kernel could not run.
 int fold_exact(eval_state_t *state, const int input, const size_t length, double *out) {
     if (CONTROL_EXACT_LOWERS_TO_TREE) {
-        return fold_replay(state, input, length, out);
+        return fold_replay(state, input, length, 1, out);
     }
     *out = fold_strict(state, input, length);
     return 1;

@@ -12,20 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef RL_GENERATOR_H
-#define RL_GENERATOR_H
+#ifndef LANELANG_GENERATOR_H
+#define LANELANG_GENERATOR_H
 
 #include <stddef.h>
 #include <stdint.h>
 
 // generator_fill writes values[0..count) deterministically.
 //
-// A seed that mixes to a zero state is replaced by a fixed one, because a xorshift stream
-// cannot leave zero. The bit patterns are identical on any IEEE-754 binary64 host.
+// A seed that mixes to a zero state is replaced by a fixed one because a xorshift stream
+// cannot leave zero. With binary64 arithmetic rounded to nearest, ties to even, the same
+// seed and count produce identical bit patterns.
 //
 // Takes seed (uint64_t) which seeds the generator.
 // Takes values (double) which receives the column.
 // Takes count (size_t) which is how many values to write.
 void generator_fill(uint64_t seed, double *values, size_t count);
 
-#endif  // RL_GENERATOR_H
+#endif  // LANELANG_GENERATOR_H

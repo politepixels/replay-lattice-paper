@@ -34,35 +34,30 @@ typedef enum {
     // state.
     OP_INPUT,
 
-    // OP_SOURCE is source(count: n), an external source, which is a leaf and is not
-    // grounded, because its bits move with the world rather than with the schedule.
+    // OP_SOURCE represents `source(count: n)`. This leaf reads an external column whose
+    // bits depend on the input world.
     OP_SOURCE,
 
     // OP_CONST is a literal.
     OP_CONST,
 
-    // OP_INDICES is indices(count: n), a generated column, deterministic by construction.
+    // OP_INDICES represents `indices(count: n)`, a deterministic generated column.
     OP_INDICES,
 
-    // OP_INTEGERS is integers(count: n), a generated column of `exact` integers, each
-    // small enough that addition below 2^53 cannot round.
+    // OP_INTEGERS represents `integers(count: n)`, a deterministic column of exactly
+    // representable integers.
     OP_INTEGERS,
 
     // OP_ELEM is elementwise addition, subtraction, multiplication or division, which is
     // lane-neutral.
     OP_ELEM,
 
-    // OP_CHOOSE is choose(when: mask, then: a, else: b), the conditional, taken
-    // elementwise: per position the result is `a` where the mask is non-zero and `b`
-    // where it is zero. Any column may be a mask, because the language has no comparison
-    // operators.
+    // OP_CHOOSE represents `choose(when: mask, then: a, else: b)`. Each position selects
+    // `a` for a non-zero mask and `b` for zero. Any column can serve as the mask.
     //
-    // Both arms are operands of this node, so both contribute to the join at every
-    // position whichever the mask selects, and each position takes one arm's value
-    // unchanged, a select rather than a blend. The evaluator computes only the selected
-    // arm per position, but the lane is read off `in` before anything is evaluated, so a
-    // mask pinned at `approx` carries `approx` into the result with blame on the mask,
-    // and no rule mentions this op.
+    // The mask and both arms contribute to the ordinary lane join. Each result element
+    // takes the selected arm's value unchanged. An `approx` mask can therefore make the
+    // result `approx` even when the arms are `exact`.
     OP_CHOOSE,
 
     // OP_FOLD is a whole-column reduction, whose schedule class says which kernel it
@@ -73,32 +68,28 @@ typedef enum {
     // lowers to.
     OP_SCAN,
 
-    // OP_RECUR is recur(init: e, body: e'), a carried-state recurrence, where `body` may
-    // name the binding it defines. It is evaluated strictly in index order, so it has
-    // exactly one schedule and a neutral class; its carried edge is the only cycle the
-    // language admits, and the reason lattice_check iterates to a fixed point.
+    // OP_RECUR holds the value that `iterate(times: n, from: e, with: step)` carries
+    // between ticks. Ticks run in index order, so the recurrence itself has a neutral
+    // schedule class. Its carried edge can close a cycle, which is why lattice_check
+    // iterates to a fixed point.
     OP_RECUR,
 
-    // OP_TICK is the 0-based tick index of the recurrence named by `tick_of`, which is
-    // the second parameter of that recurrence's step function. It is a leaf: a tick index
-    // is a function of the program rather than of any value, so it takes no operand and
-    // no carried edge, it is `exact`, it is grounded, and no carried edge leads from it.
+    // OP_TICK reads the zero-based index of the recurrence named by `tick_of`. It
+    // supplies the second parameter of the step function. The program fixes this index,
+    // so the leaf is grounded and `exact` and has no input or carried edge.
     OP_TICK,
 
-    // OP_OPAQUE wraps the result of a call to a function declared `ungrounded`. It has
-    // exactly one input, the body's lowered result, and its class is neutral: it computes
-    // nothing and its lane is its input's. It exists to record the grounding answer, so
-    // `ground_of_node` answers false for it whatever its input says. It never interns, so
-    // `bless` can stay out of the interning key.
+    // OP_OPAQUE wraps the result of a call declared `ungrounded` and inherits its body's
+    // lane. The checker treats the call as unfixed. A demand can rely on it if the call
+    // has a waiver and the body is fixed or covered by waivers. Each call gets a fresh
+    // wrapper.
     OP_OPAQUE,
 
-    // OP_DEMAND carries a demand the source wrote about a value. It has exactly one
-    // input, the value demanded, and its class is neutral: it computes nothing and its
-    // lane is its input's. It is its own node so that a demand on a shared value cannot
-    // reach the value's other names, and unlike OP_OPAQUE it interns: `replay a :=
-    // sum(x)` beside `replay b := sum(x)` is one node rather than two. Its `declared`
-    // field is part of the interning key, so it is set before the node is offered to
-    // dag_intern.
+    // OP_DEMAND records a written demand on its single input and inherits the input's
+    // lane. The separate node keeps a demand on one binding from applying to the value's
+    // other names. Equivalent demands may share a node, as in `replay a := sum(x)`
+    // alongside `replay b := sum(x)`. The builder sets `declared` before interning
+    // because it contributes to the key.
     OP_DEMAND
 } dagop_t;
 
@@ -108,10 +99,8 @@ typedef struct {
     // op is what the node computes.
     dagop_t op;
 
-    // in holds the indices of the operand nodes, in operand order; only the first
-    // `input_count` entries mean anything. dag_node_init clears the node to zero bytes,
-    // so an unused entry holds 0, which is a real node index rather than a sentinel, and
-    // a reader that trusts the array past `input_count` is reading node 0 as an operand.
+    // in holds the indices of the `input_count` operands in source order. dag_node_init
+    // clears the unused entries to zero, which is also a valid node index.
     int in[DAG_MAX_INPUTS];
 
     // input_count is how many entries of `in` are in use.
@@ -123,31 +112,32 @@ typedef struct {
     // must be strictly earlier than their consumer.
     int carried;
 
-    // tick_of is the OP_RECUR node this OP_TICK counts, or -1 for every other node. It is
-    // part of the interning key, because two tick nodes belonging to different
-    // recurrences are two different values; without it a nested recurrence would intern
-    // its inner tick onto the outer one and read the wrong counter. It is not an entry of
-    // `in`, because the tick index does not read the carried value, and joining the
-    // recurrence's lane into it would weaken every tick index.
+    // step_end is the last node emitted while lowering the recurrence's step. A nested
+    // recurrence may appear earlier in this range than the nodes that compute its final
+    // carry.
+    int step_end;
+
+    // tick_of identifies the OP_RECUR node whose counter an OP_TICK reads. Every other
+    // node holds -1 here. Including the owner in the interning key keeps nested counters
+    // distinct. The tick index is independent of the carried value, so the lane join only
+    // follows `in` and `carried`.
     int tick_of;
 
     // op_class is the schedule class of this operation's own lowering contract.
     opclass_t op_class;
 
-    // declared is the demand stated at this node, or LANE_NONE when the source stated
-    // none. It is non-zero only on OP_DEMAND and is set before that node is interned,
-    // because it is part of the interning key, and a key field written after a node may
-    // have been shared changes the node's identity under whoever already holds it.
+    // declared is the demand stated at this node, or LANE_NONE. The resolver sets it on
+    // an OP_DEMAND wrapper before interning because it is part of the interning key.
     lane_t declared;
 
-    // lane is the ambient lane the node was built under, which is part of its identity.
+    // lane records the construction lane used for interning. When healing strengthens a
+    // producer, it updates this field to the selected kernel's lane.
     lane_t lane;
 
-    // promise identifies the call whose declared return lane this node was built under,
-    // or 0 for a node built anywhere else. It is identity rather than a contract: it
-    // separates the cones of two calls without touching which kernel either lowers to, so
-    // within one call the body's nodes share and across two calls they do not. It is part
-    // of the interning key and is set before the node is interned.
+    // promise identifies the call whose declared return lane encloses this node, or zero
+    // outside such a call. The interning key includes this identifier so nodes can share
+    // within a call while separate calls retain their own cones. The operation's class
+    // still selects the kernel.
     int promise;
 
     // span is where the node's operation appears in the source.
@@ -157,47 +147,44 @@ typedef struct {
     // 0 when it has none.
     span_t declared_span;
 
+    // argument_span is where the argument a parameter's demand covers is written in the
+    // call, or a span with line 0 when the demand is not on a parameter. A refusal of the
+    // demand points here as well, so the blame reaches the call that supplied the value.
+    span_t argument_span;
+
     // constant is the literal for OP_CONST, the element count for OP_INDICES, OP_INTEGERS
     // and OP_SOURCE, and the tick count for OP_RECUR.
     double constant;
 
-    // binary_operator is the operator for OP_ELEM, one of '+', '-', '*' or '/'. Part of
-    // the interning key for the same reason `constant` is.
+    // binary_operator holds the OP_ELEM operator, one of '+', '-', '*' or '/'. Like
+    // `constant`, it contributes to the interning key.
     int binary_operator;
 
-    // bless is what a `@bless` on this node promises: 0 for none, BLESS_PROMISE for the
-    // bare form, `checksum + 1` for the conditional one. It is non-zero only on OP_SOURCE
-    // and OP_OPAQUE, the two kinds a waiver may bind to, and only the bare form on
-    // OP_OPAQUE, because a checksum is verified against the column a source loads and
-    // there is no such column behind a call. It is not part of the interning key, and the
-    // waiver's kinds must stay the set of kinds dag_intern never interns, because a
-    // waiver on a node the interner may hand to a second owner is a promise about a value
-    // its writer never saw. The absent value is 0 because the checksum is stored biased
-    // by one.
+    // bless records a waiver on a node. Zero means the waiver is absent, BLESS_PROMISE
+    // records the bare form, and `checksum + 1` records a checksum for the evaluator to
+    // verify. Only OP_SOURCE loads a column to verify. OP_OPAQUE accepts only a bare
+    // waiver. Neither kind is interned, so the waiver applies to one source or call.
     long long bless;
 
     // stated_by_binding is 1 on a demand node a binding's qualifier wrote, and 0 on every
     // other node, a parameter's demand and a call's return promise among them. Healing
     // stops only at a demand of another lane that a binding wrote, so a lane the source
     // wrote on a binding bounds what healing may strengthen, while a parameter or a
-    // promise does not keep a private producer from healing. It is not part of the
-    // interning key, and a binding that reuses a node sets it there.
+    // promise does not keep a private producer from healing. The interning key keeps
+    // these uses distinct even when they demand the same lane on the same value.
     int stated_by_binding;
 
-    // uses is how many times nodes that reach the function result read this node, counted
-    // per operand edge rather than per distinct consumer, plus one for the result itself.
-    // It is a liveness flag: heal.c compares it to zero and to nothing else, and privacy
-    // is decided by mark_escapes' read-path closure rather than by this count, so a
-    // consumer naming this node twice counts twice and carries no verdict.
+    // uses counts each ordinary or carried edge read by a node that reaches the result,
+    // plus one for the result itself. Healing uses a non-zero count to recognise a live
+    // node. mark_escapes separately determines whether its value escapes the demanded
+    // cone.
     int uses;
 
-    // reached is scratch for dag_recount_uses: non-zero once this node is known to reach
-    // the function result.
+    // reached is non-zero once dag_recount_uses finds that this node reaches the result.
     int reached;
 
-    // label is the source name of the binding this node came from, borrowed from the
-    // source text, or NULL when the node has no name. Used by diagnostics and by the
-    // figures.
+    // label is the name shown in diagnostics and figures, or NULL for an unnamed node. It
+    // points to source text or to a string supplied by the builder.
     const char *label;
 
     // label_length is the length of `label` in bytes, or 0 when there is none.
@@ -215,10 +202,11 @@ typedef struct {
 static inline void dag_node_init(dagnode_t *node) {
     memset(node, 0, sizeof *node);
     node->carried = -1;
+    node->step_end = -1;
     node->tick_of = -1;
 }
 
-// dag_t is the graph itself: a growable array of nodes in dependency order.
+// dag_t stores the graph in a growable array of nodes in dependency order.
 typedef struct dag dag_t;
 
 // dag_new creates an empty graph.
@@ -235,9 +223,8 @@ void dag_free(dag_t *g);
 // Takes g (dag_t) which is the graph being walked.
 // Takes node (dagnode_t) which is the node under examination.
 //
-// Returns the index of an existing node that is structurally and contractually identical
-// to `node` when one exists, otherwise appends `node` and returns its index.
-// Returns -1 if allocation fails.
+// Returns the matching node's index when sharing is legal, or the newly appended node's
+// index. Returns -1 if allocation fails.
 int dag_intern(dag_t *g, const dagnode_t *node);
 
 // dag_append appends `node` without interning, for nodes that must stay distinct however
@@ -266,6 +253,13 @@ dagnode_t *dag_at(dag_t *g, int i);
 // Takes g (dag_t) which is the graph being walked.
 // Takes i (int) which is the element being read.
 const dagnode_t *dag_at_const(const dag_t *g, int i);
+
+// dag_mark_cone marks a node and its transitive inputs, including recurrence carries.
+//
+// Takes g (dag_t) which is the graph being walked.
+// Takes at (int) which is the node whose inputs to mark.
+// Takes cone (char) which holds one byte per node, initially zero for an empty cone.
+void dag_mark_cone(const dag_t *g, int at, char *cone);
 
 // dag_recount_uses recomputes `uses` across the graph.
 //

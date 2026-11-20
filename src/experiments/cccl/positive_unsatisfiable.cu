@@ -14,14 +14,10 @@
 #include <cub/device/device_reduce.cuh>
 #include <cuda/__execution/require.h>
 
-// The execution namespace holding `require`.
 namespace ex  = cuda::execution;
 
-// The namespace holding the determinism guarantees themselves.
 namespace det = ex::determinism;
 
-// unsatisfiable reduces `in` into `out` under multiplies over float, demanding a guarantee CCCL
-// cannot give for that combination.
 void unsatisfiable(float *in, float *out) {
     (void) cub::DeviceReduce::Reduce(in, out, 100, cuda::std::multiplies<float>{}, 1.0f,
                                      ex::require(det::gpu_to_gpu));

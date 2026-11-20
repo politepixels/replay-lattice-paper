@@ -14,16 +14,25 @@
 
 #include "lexer.h"
 
-// errno and ERANGE: strtod reports an out-of-range literal only through errno.
 #include <errno.h>
+#include <float.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
-// MAX_NUMBER_DIGITS is how many bytes of a numeric literal are handed to strtod,
-// including the terminator. A longer literal is a lexing error: truncating it could
-// silently drop an exponent and change the value.
+// MAX_NUMBER_DIGITS is the size of the conversion buffer, including its terminator. A
+// longer literal is a lexing error because truncation could drop its exponent.
 #define MAX_NUMBER_DIGITS 64
+
+// LEXER_QUALIFIERS gives each reserved spelling its lane. The parser uses the same
+// entries to interpret qualifiers and suggest a correction for a misspelt word.
+const qualifier_word_t LEXER_QUALIFIERS[] = {
+    {"replay", LANE_REPLAY},
+    {"exact", LANE_EXACT},
+    {"approx", LANE_APPROX},
+    {"ungrounded", LANE_NONE},
+    {NULL, LANE_NONE},
+};
 
 // PUNCTUATION is the punctuation that is one character long, paired with the token kind
 // it produces. A colon is absent from this table because it may begin `:=`, which needs a
@@ -49,10 +58,8 @@ static const struct {
     {'/', TK_SLASH},
 };
 
-// KIND_NAMES pairs each token kind with how a diagnostic should name it: an English
-// phrase for the kinds that have no spelling, and the quoted spelling itself for the
-// rest. A kind absent here renders as "invalid token", and TK_ERROR is left out so that
-// it renders that way.
+// KIND_NAMES gives each token kind its diagnostic name. Punctuation uses its quoted
+// spelling. Other tokens have English names. TK_ERROR takes the default "invalid token".
 static const struct {
     // kind is the token kind being named.
     token_kind_t kind;
@@ -159,8 +166,7 @@ static int lexer_skip_line_comment(lexer_t *lexer) {
     return 1;
 }
 
-// lexer_skip_trivia advances past everything between tokens: whitespace and `//`
-// comments, in any order and any number.
+// lexer_skip_trivia advances past any mixture of whitespace and `//` comments.
 //
 // Takes lexer (lexer_t) which is the token cursor.
 static void lexer_skip_trivia(lexer_t *lexer) {
@@ -185,6 +191,7 @@ static token_t lexer_make_token(
 ) {
     token_t token;
     token.kind = kind;
+    token.qualifier = NULL;
     token.text = start;
     token.length = (int) (lexer->cursor - start);
     token.number = 0;
@@ -195,28 +202,12 @@ static token_t lexer_make_token(
     return token;
 }
 
-#ifndef LANELANG_QUALIFIERS_UNRESERVED
-// lexer_word_is compares a scanned run against a word.
-//
-// It sits inside the guard with its only caller, because the build that defines
-// LANELANG_QUALIFIERS_UNRESERVED removes that caller, and a helper left outside would
-// then be defined and unused, failing that build under -Wall -Wextra.
-//
-// Takes start (char) which is where the run begins.
-// Takes length (size_t) which is how many bytes the run occupies.
-// Takes word (char) which is the word to compare against.
-// Returns 1 when the run is exactly that word.
-static int lexer_word_is(const char *start, const size_t length, const char *word) {
-    return length == strlen(word) && memcmp(start, word, length) == 0;
-}
-#endif
-
 // lexer_scan_identifier scans an identifier, giving the four lane qualifiers their own
 // kind and leaving every other keyword for the parser to match itself.
 //
 // The qualifiers are the only reserved words, because they are the only ones a program
-// can bind such that a demand disappears with no diagnostic; every other keyword draws a
-// diagnostic when misused.
+// can bind while silently losing a demand. The control build also records the matched
+// spelling so the parser can recognise a qualifier by lookahead.
 //
 // Takes lexer (lexer_t) which is the token cursor.
 // Takes start (char) which is where the run begins.
@@ -226,16 +217,17 @@ static token_t lexer_scan_identifier(lexer_t *lexer, const char *start, const in
     while (lexer_is_identifier_continue((unsigned char) *lexer->cursor)) {
         lexer_advance(lexer);
     }
-#ifdef LANELANG_QUALIFIERS_UNRESERVED
-    return lexer_make_token(lexer, TK_IDENT, start, line, column);
-#else
-    const size_t length = (size_t) (lexer->cursor - start);
-    const int qualifier = lexer_word_is(start, length, "replay")
-                          || lexer_word_is(start, length, "exact")
-                          || lexer_word_is(start, length, "approx")
-                          || lexer_word_is(start, length, "ungrounded");
-    return lexer_make_token(lexer, qualifier ? TK_QUALIFIER : TK_IDENT, start, line, column);
+    token_t token = lexer_make_token(lexer, TK_IDENT, start, line, column);
+    for (const qualifier_word_t *word = LEXER_QUALIFIERS; word->spelling; word++) {
+        if (lexer_token_is(&token, word->spelling)) {
+            token.qualifier = word;
+#ifndef LANELANG_QUALIFIERS_UNRESERVED
+            token.kind = TK_QUALIFIER;
 #endif
+            break;
+        }
+    }
+    return token;
 }
 
 // lexer_scan_digits advances past a run of decimal digits, which may be empty.
@@ -294,14 +286,13 @@ static void lexer_scan_exponent(lexer_t *lexer) {
 // source rather than a terminated string, so it is copied into a bounded buffer before
 // strtod sees it.
 //
-// No end pointer is passed to strtod, because the lexer has already established that
-// every byte of `digits` is part of a number literal, so there is no unparseable input
-// for it to answer 0 for. The out parameter carries the range failure: strtod reports
-// overflow through errno and still returns a value, so discarding it turns `1e999` into a
-// silent positive infinity and `1e-999` into a silent zero.
+// The scanner has already checked the spelling. strtod still returns a value on a range
+// error, so the caller checks `out_of_range` before accepting it. Otherwise `1e999` would
+// silently become positive infinity and `1e-999` would become zero.
 //
 // Takes token (token_t) which is the token under the cursor.
-// Takes out_of_range (int) which receives 1 when the literal does not fit a binary64.
+// Takes out_of_range (int) which receives 1 when the literal overflowed or underflowed to
+// zero.
 static double lexer_number_value(const token_t *token, int *out_of_range) {
     char digits[MAX_NUMBER_DIGITS];
     const int limit = (int) sizeof digits - 1;
@@ -310,22 +301,21 @@ static double lexer_number_value(const token_t *token, int *out_of_range) {
     digits[copy_length] = '\0';
     errno = 0;
     const double value = strtod(digits, NULL);
-    *out_of_range = (errno == ERANGE);
+    *out_of_range = errno == ERANGE && (value == 0.0 || value > DBL_MAX || value < -DBL_MAX);
     return value;
 }
 
-// lexer_scan_number scans a numeric literal: either `0x` and a run of hexadecimal digits,
-// or a run of decimal digits with an optional fractional part and an optional exponent. A
-// literal too long for the value buffer is reported and returned as TK_ERROR.
+// lexer_scan_number reads hexadecimal integers and decimal numbers with an optional
+// fractional part and exponent. A literal too long for the value buffer yields TK_ERROR.
 //
 // The `0x` prefix is recognised because without it `0x1234abcd` scans as the number `0`
-// followed by the identifier `x1234abcd`: two tokens and no diagnostic, at the position
-// where a checksum is written. A `0x` with no digit after it is an error rather than a
-// zero. strtod parses what is scanned here without further help, since C99 gives it
-// hexadecimal floating constants, and a 32-bit checksum is exact in a binary64 well below
-// 2^53. The `p` exponent is not scanned, because a checksum is an integer and `0x1p3`
-// would mean 8; written anyway, it scans as `0x1` and the identifier `p3`, which the
-// parser refuses where it expects a closing parenthesis.
+// followed by the identifier `x1234abcd` where a checksum is written. A `0x` with no
+// digit after it is an error rather than a zero. strtod parses what is scanned here
+// without further help, since C99 gives it hexadecimal floating constants, and a 32-bit
+// checksum is exact in a binary64 well below 2^53. The `p` exponent is not scanned,
+// because a checksum is an integer and `0x1p3` would mean 8. That spelling scans as `0x1`
+// and the identifier `p3`, which the parser refuses where it expects a closing
+// parenthesis.
 //
 // Takes lexer (lexer_t) which is the token cursor.
 // Takes start (char) which is where the run begins.
@@ -372,8 +362,8 @@ static token_t lexer_scan_number(lexer_t *lexer, const char *start, const int li
     return token;
 }
 
-// lexer_punctuation_kind finds the token kind for a single punctuation character, or
-// TK_ERROR when it is not punctuation.
+// lexer_punctuation_kind looks up a character in PUNCTUATION and returns TK_ERROR if it
+// has no entry.
 //
 // Takes character (char) which is the byte under the cursor.
 static token_kind_t lexer_punctuation_kind(const char character) {

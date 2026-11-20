@@ -17,25 +17,30 @@
 #include "generator.h"
 #include "kernels.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// EVAL_MAX_INDICES is the largest column a source or generator materialises; a larger
-// count is clamped, which keeps an enormous request from exhausting memory. A count below
-// one is raised to one, because this evaluator has no representation for an empty column:
-// eval_element_of broadcasts any column of length one or less by reading element zero,
-// and a zero-length column would be a null pointer that nothing may read.
+// EVAL_MAX_INDICES bounds the number of elements in one source or generated column.
 #define EVAL_MAX_INDICES 100000
 
-// g_column_elements is how many elements the last run wrote to whole-column storage, kept
-// at file scope because it is diagnostic and this evaluator is single-threaded.
-static size_t g_column_elements;
+// g_column_elements counts element slots allocated for materialised nodes in the calling
+// thread's last run.
+static _Thread_local size_t g_column_elements;
 
-// g_tile_elements is how many elements the last run wrote to tile storage.
-static size_t g_tile_elements;
+// g_tile_elements counts all tile writes in the calling thread's last run.
+static _Thread_local size_t g_tile_elements;
 
-// eval_last_footprint reports the last run's column and tile footprints; either pointer
+// g_replay_workers records the largest completed replay team in the last run.
+static _Thread_local int g_replay_workers;
+
+// eval_last_replay_workers returns the largest completed replay team in the last run.
+int eval_last_replay_workers(void) {
+    return g_replay_workers;
+}
+
+// eval_last_footprint reports the last run's column and tile footprints. Either pointer
 // may be NULL.
 //
 // Takes columns (size_t) which receives the column footprint.
@@ -49,9 +54,8 @@ void eval_last_footprint(size_t *columns, size_t *tiles) {
     }
 }
 
-// eval_apply_binary_operator applies one elementwise operator. An operator that is not
-// '+', '-', '*' or '/' is treated as addition; a graph built by the resolver never
-// contains one.
+// eval_apply_binary_operator applies one elementwise operator. The resolver emits '+',
+// '-', '*' and '/'. An unknown operator defaults to addition.
 //
 // Takes binary_operator (int) which is the operator character.
 // Takes left (double) which is the first operand.
@@ -66,16 +70,12 @@ static double eval_apply_binary_operator(const int binary_operator, const double
     }
 }
 
-// eval_compute_element computes element `position` of node `node_index` without
-// consulting the tile cache.
+// eval_compute_element reads a materialised value or computes it without consulting this
+// node's tile cache.
 //
-// The recursion terminates because a materialised node returns immediately and every leaf
-// is materialised; a fold is a scalar and is always materialised by the time anything
-// reads it, so only elementwise work reaches the fallback. OP_CHOOSE, OP_OPAQUE and
-// OP_DEMAND materialise only under EVAL_MATERIALISE, so without the guards a fused or
-// tiled read of a one-input wrapper would fall into the binary fallback and read `in[1]`,
-// which is -1 on a one-input node, and a fused or tiled read of a choose would never look
-// at its third operand.
+// Reads stop at a materialised node. In fused and tiled traversals, OP_CHOOSE reads its
+// mask and the selected arm. OP_OPAQUE and OP_DEMAND forward their operand. The remaining
+// unmaterialised nodes are binary elementwise operations.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes node_index (int) which is the node's index in the graph.
@@ -109,20 +109,18 @@ static double eval_compute_element(eval_state_t *state, const int node_index,
 static void eval_refill_tile(eval_state_t *state, const int node_index, const size_t position) {
     const size_t length = state->lengths[node_index];
     const size_t low = (position / state->tile_length) * state->tile_length;
-    size_t high = low + state->tile_length;
-    if (high > length) {
-        high = length;
-    }
+    const size_t high = state->tiles[node_index].capacity > length - low
+                        ? length : low + state->tiles[node_index].capacity;
     for (size_t t = low; t < high; t++) {
-        state->tile_buffers[node_index][t - low] = eval_compute_element(state, node_index, t);
+        state->tiles[node_index].values[t - low] = eval_compute_element(state, node_index, t);
     }
-    state->tile_low[node_index] = low;
-    state->tile_high[node_index] = high;
-    g_tile_elements += high - low;
+    state->tiles[node_index].low = low;
+    state->tiles[node_index].high = high;
+    state->tile_elements += high - low;
 }
 
-// eval_element_of reads element `position` of node `node_index`, broadcasting a scalar
-// over any position and going through the tile cache when the traversal is tiled.
+// eval_element_of broadcasts a scalar over any position. It reads materialised columns
+// directly and uses the tile cache for deferred producers in a tiled traversal.
 //
 // Columns longer than one are always read in range, because the materialise guards refuse
 // mismatched lengths before any read happens.
@@ -141,14 +139,14 @@ double eval_element_of(eval_state_t *state, const int node_index, const size_t p
 
     const size_t length = state->lengths[node_index];
     const size_t k = (length <= 1) ? 0 : position % length;
-    if (k < state->tile_low[node_index] || k >= state->tile_high[node_index]) {
+    if (k < state->tiles[node_index].low || k >= state->tiles[node_index].high) {
         eval_refill_tile(state, node_index, k);
     }
-    return state->tile_buffers[node_index][k - state->tile_low[node_index]];
+    return state->tiles[node_index].values[k - state->tiles[node_index].low];
 }
 
-// eval_perturbation is the name of the schedule perturbation compiled into this build,
-// "-" when there is none.
+// eval_perturbation names the tile-rebrackets or pinned-eval-breaks control when active.
+// Other builds return "-".
 const char *eval_perturbation(void) {
 #ifdef RL_TILE_REBRACKETS
     return "tile-rebrackets";
@@ -162,9 +160,8 @@ const char *eval_perturbation(void) {
 // eval_alloc_column gives node `index` whole-column storage of `length` elements and
 // counts it against the column footprint.
 //
-// Freeing first makes this re-entrant, which a recurrence needs: the nodes between a
-// recurrence and its body are materialised once per iteration, and without it each pass
-// would leak the previous one's storage; for every other node the free is a no-op.
+// A recurrence can materialise the same node on each iteration. Freeing its previous
+// column before allocating the next one lets successive iterations use different lengths.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -182,12 +179,10 @@ static int eval_alloc_column(eval_state_t *state, const int index, const size_t 
     return 1;
 }
 
-// eval_materialise_leaf materialises a literal or an external input as a one-element
-// column.
+// eval_materialise_leaf materialises a literal or a parameter as a one-element column.
 //
-// An input has no value in the source, so it is given a fixed one: this evaluator
-// compares a graph against itself under different schedules, and any value that is the
-// same on both sides serves.
+// A parameter has no value in the source. Giving it a fixed value keeps its input
+// identical across the schedules being compared.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -202,11 +197,9 @@ static int eval_materialise_leaf(eval_state_t *state, const int index, const dag
 
 // eval_materialise_scan materialises a scan as a whole column.
 //
-// Elements are read through eval_element_of, never from `columns[input]` directly,
-// because under a fused or tiled traversal an elementwise producer has no materialised
-// column and reading one would be a null dereference. A scan's serial reference is one
-// running total left to right, the same as scan_free at one worker, so the reference path
-// calls scan_free with workers=1 rather than adding a fourth kernel.
+// Both scan kernels read through eval_element_of so a deferred input can supply its
+// values on demand. The reference calls scan_free with one worker, giving one
+// left-to-right chunk.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -241,10 +234,9 @@ static int eval_materialise_scan(
 
 // eval_bless_checksum is FNV-1a over a column's bit patterns.
 //
-// Bit patterns rather than values, because the bless is a claim about the bytes that
-// entered the computation: a signed zero and a NaN payload are values a comparison would
-// call equal and a rerun would not reproduce. It is a checksum: it detects a file that
-// changed, not an adversary who changed it, and nothing here resists a chosen collision.
+// The checksum covers the bytes loaded, including the sign of zero and the payload of a
+// NaN. Numeric equality cannot distinguish the two signs of zero or compare NaN payloads.
+// FNV-1a detects accidental changes but gives no protection against a chosen collision.
 //
 // Takes data (double) which is the column to fingerprint.
 // Takes count (size_t) which is how many elements it holds.
@@ -260,13 +252,9 @@ unsigned eval_bless_checksum(const double *data, const size_t count) {
 // bless_checksum_holds verifies a blessed source against the column just loaded,
 // returning 0 when a declared checksum does not match it.
 //
-// The check runs before any arithmetic over the column and fails closed, because a run
-// that carried on would produce numbers a downstream reader believes are reproducible,
-// with nothing saying otherwise. The diagnostic says which claim broke: the lane still
-// holds and the fold order is unchanged, while what is false is the developer's premise
-// that the bytes would be the same next run. `count` is the clamped count, which is the
-// column that exists; a checksum taken over what was asked for rather than over what was
-// loaded would never match.
+// A mismatch stops the run before any arithmetic over the column. The diagnostic
+// distinguishes the two claims. The fold order still satisfies the requested lane, but
+// the loaded bytes no longer match the recorded checksum.
 //
 // Takes node (dagnode_t) which is the source node under examination.
 // Takes data (double) which is the column just loaded.
@@ -287,89 +275,59 @@ static int bless_checksum_holds(const dagnode_t *node, const double *data, const
     return 0;
 }
 
-// eval_materialise_source materialises an external source: a column the program does not
-// fix.
-//
-// The value depends on `state->world`, which the caller varies between runs; every other
-// leaf is a fixed function of the program, so this op is the one place a world change can
-// reach the arithmetic.
+// eval_alloc_input allocates a source or generated column of the requested length.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
-// Takes index (int) which is the node's index in the graph.
-// Takes node (dagnode_t) which is the node under examination.
-static int eval_materialise_source(eval_state_t *state, const int index, const dagnode_t *node) {
-    double wanted = node->constant;
-    if (wanted != wanted) {
+// Takes index (int) which is the node that will own the column.
+// Takes node (dagnode_t) which holds the requested length.
+// Returns zero if the length is unknown, fractional or outside the supported range, or if
+// allocation fails.
+static int eval_alloc_input(eval_state_t *state, const int index, const dagnode_t *node) {
+    const double count = node->constant;
+    if (count != count) {
+        fprintf(stderr, "lanelang: column length is unknown at evaluation time\n");
         return 0;
     }
-    if (!(wanted >= 1.0)) {
-        wanted = 1.0;
-    }
-    if (wanted > (double) EVAL_MAX_INDICES) {
-        wanted = (double) EVAL_MAX_INDICES;
-    }
-    const size_t count = (size_t) wanted;
-    if (!eval_alloc_column(state, index, count)) {
+    if (count < 1 || count > EVAL_MAX_INDICES || count != (double) (size_t) count) {
+        fprintf(stderr, "lanelang: requested column length %.17g (expected a whole number from 1 to %d)\n",
+                count, EVAL_MAX_INDICES);
         return 0;
     }
-    generator_fill(state->world, state->columns[index], count);
-    return bless_checksum_holds(node, state->columns[index], count);
+    return eval_alloc_column(state, index, (size_t) count);
 }
 
-// eval_materialise_indices materialises a generated column, drawn from the generator.
-//
-// The count is clamped while still a double, because converting a double outside size_t's
-// range is undefined behaviour (C11 6.3.1.4); the first test also catches NaN.
+// eval_materialise_generated fills a source column from the current world or an indices
+// column from world 1.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
-// Takes index (int) which is the node's index in the graph.
-// Takes node (dagnode_t) which is the node under examination.
-static int eval_materialise_indices(eval_state_t *state, const int index, const dagnode_t *node) {
-    double wanted = node->constant;
-    if (wanted != wanted) {
+// Takes index (int) which is the node that will own the column.
+// Takes node (dagnode_t) which selects the generator and holds any source checksum.
+// Returns zero if the column cannot be allocated at its requested length or the source
+// fails its checksum.
+static int eval_materialise_generated(eval_state_t *state, const int index, const dagnode_t *node) {
+    if (!eval_alloc_input(state, index, node)) {
         return 0;
     }
-    if (!(wanted >= 1.0)) {
-        wanted = 1.0;
-    }
-    if (wanted > (double) EVAL_MAX_INDICES) {
-        wanted = (double) EVAL_MAX_INDICES;
-    }
-    const size_t count = (size_t) wanted;
-    if (!eval_alloc_column(state, index, count)) {
-        return 0;
-    }
-    generator_fill(1u, state->columns[index], count);
-    return 1;
+    const size_t count = state->lengths[index];
+    const unsigned seed = node->op == OP_SOURCE ? state->world : 1u;
+    generator_fill(seed, state->columns[index], count);
+    return node->op != OP_SOURCE || bless_checksum_holds(node, state->columns[index], count);
 }
 
 // eval_materialise_integers materialises a column of `exact` integers.
 //
-// The values alternate sign and span three orders of magnitude, so a wrong fold order
-// would be visible in the bits if the arithmetic could round; every element and every
-// reachable partial stays well inside 2^53, so no schedule can move a bit. The pattern is
-// a pure function of the index, so the column is identical on every machine and the bit
-// patterns a check freezes are portable.
+// The values alternate in sign and their magnitudes depend only on the index. At the
+// supported column lengths, their absolute values sum to less than 2^53. Every partial
+// sum is therefore an exactly representable integer, whatever the schedule.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
 // Takes node (dagnode_t) which is the node under examination.
 static int eval_materialise_integers(eval_state_t *state, const int index, const dagnode_t *node) {
-    double wanted = node->constant;
-    if (wanted != wanted) {
+    if (!eval_alloc_input(state, index, node)) {
         return 0;
     }
-    if (!(wanted >= 1.0)) {
-        wanted = 1.0;
-    }
-    if (wanted > (double) EVAL_MAX_INDICES) {
-        wanted = (double) EVAL_MAX_INDICES;
-    }
-    const size_t count = (size_t) wanted;
-    if (!eval_alloc_column(state, index, count)) {
-        return 0;
-    }
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < state->lengths[index]; i++) {
         const double magnitude = (double) (long long) ((i % 997u) * 1021u + 1u);
         state->columns[index][i] = (i % 2u) ? -magnitude : magnitude;
     }
@@ -378,9 +336,9 @@ static int eval_materialise_integers(eval_state_t *state, const int index, const
 
 // eval_materialise_elementwise materialises an elementwise node, or leaves it fused.
 //
-// Operand columns of different lengths are refused unless one is a scalar, which
-// broadcasts; without the guard the shorter column would be read modulo its length,
-// wrapping around in silence.
+// A scalar broadcasts to the other operand's length. Two longer columns must have the
+// same length because indexing the shorter one modulo its length would silently repeat
+// its elements.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -419,15 +377,13 @@ static int eval_materialise_elementwise(
     return 1;
 }
 
-// eval_materialise_choose computes choose(when:, then:, else:) elementwise and returns 1,
-// or 0 if a column could not be allocated.
+// eval_materialise_choose computes choose(when:, then:, else:) elementwise. It returns
+// zero if the shapes disagree or allocation fails.
 //
-// Both arms are materialised whatever the mask holds, and that is the semantics rather
-// than a missed optimisation: predication means the result is a blend and not a jump, so
-// there is no unevaluated arm, and the loop combines nothing across positions, so its
-// class is neutral. A zero mask element takes the `else` arm and any other value takes
-// the `then` arm; this language has no comparison operators, so masks are not constrained
-// to {0.0, 1.0} and the wider reading is used.
+// The mask and both arms contribute to the result shape. A zero mask element selects the
+// corresponding element of the `else` arm, and any other value selects the `then` arm.
+// The traversal can read the selected element on demand. The choice has neutral schedule
+// class because it combines no values across positions.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node being materialised.
@@ -471,9 +427,8 @@ static int eval_materialise_choose(
 
 // eval_materialise_recur materialises a recurrence's current value.
 //
-// On the first pass this is the seed; each later pass overwrites it with the body's value
-// before the nodes between them are run again, so this establishes only the starting
-// point.
+// This sets the initial carry from the seed. After each step, eval_carry_back replaces it
+// with the body's result for the next tick.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -493,13 +448,9 @@ static int eval_materialise_recur(eval_state_t *state, const int index, const da
 // eval_materialise_fold materialises a reduction as a one-element column, using the
 // kernel its schedule class names.
 //
-// Under the reference evaluation every fold is the serial one, whatever class it carries;
-// the test sits before the switch so that a kernel added later cannot forget to be
-// covered, and no control perturbs the reference path, so the reference stays the
-// reference. The domain guard is not a schedule, so the reference owes it too: an
-// exact-integer fold refuses a column whose magnitudes sum past 2^53, and a reference
-// that answered where every schedule refused would be returning the rounded number
-// `exact` is defined as equality with.
+// The reference uses serial order for every fold. The integer fold also checks its domain
+// in the reference run, using one worker. Its inputs must be integers whose absolute
+// values sum to strictly less than 2^53.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -527,20 +478,17 @@ static int eval_materialise_fold(
     case OPC_FOLD_EXACT:  return fold_exact(state, input, length, &state->columns[index][0]);
     case OPC_FOLD_INTEGER: return fold_integer(state, input, length, workers,
                                                &state->columns[index][0]);
-    case OPC_FOLD_REPLAY: return fold_replay(state, input, length, &state->columns[index][0]);
+    case OPC_FOLD_REPLAY: return fold_replay(state, input, length, workers, &state->columns[index][0]);
     default:              state->columns[index][0] = fold_free(state, input, length, workers);
     }
     return 1;
 }
 
-// eval_materialise_opaque materialises a call declared `ungrounded` as its body's value.
+// eval_materialise_opaque forwards an opaque call or a demand wrapper to its input.
 //
-// The wrapper computes nothing, because `ungrounded` is a claim about where a value comes
-// from rather than about what it is: the node carries a grounding answer and passes the
-// arithmetic straight through, with its input's length and its input's elements. Elements
-// are read through eval_element_of rather than from the input's column, because under a
-// fused or tiled traversal a producer has no materialised column and reading one would be
-// a null dereference.
+// An opaque call passes through its body's length and elements. The `ungrounded`
+// declaration affects the grounding judgement. Reading through eval_element_of also works
+// when a fused or tiled producer has no whole column in storage.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -570,10 +518,7 @@ static int eval_materialise_opaque(
 // eval_materialise_tick gives node `index` a one-element column holding the current tick
 // of the recurrence it counts.
 //
-// The counter lives in eval_materialise_all's `done` array, because it is the state of a
-// run and not a property of the graph; a tick node sits after its recurrence and before
-// that recurrence's body, so the rewind re-materialises it once per tick and it reads 0,
-// 1, ... n-1 in turn.
+// The step reads its enclosing recurrence's current clock, starting at zero.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes index (int) which is the node's index in the graph.
@@ -596,16 +541,16 @@ static int eval_materialise_tick(eval_state_t *state, const int index, const dag
 // Takes mode (eval_mode_t) which is the traversal to evaluate under.
 // Takes workers (int) which is how many workers the schedule uses.
 // Takes done (int) which is how many ticks each recurrence has completed.
-// Returns 0 if allocation fails.
+// Returns zero if the node cannot be evaluated.
 static int eval_materialise_node(eval_state_t *state, const int index, const eval_mode_t mode,
                                  const int workers, const int *done) {
     const dagnode_t *node = dag_at_const(state->graph, index);
     switch (node->op) {
     case OP_CONST:
     case OP_INPUT:   return eval_materialise_leaf(state, index, node);
-    case OP_SOURCE:  return eval_materialise_source(state, index, node);
+    case OP_SOURCE:
+    case OP_INDICES: return eval_materialise_generated(state, index, node);
     case OP_SCAN:    return eval_materialise_scan(state, index, node, workers);
-    case OP_INDICES: return eval_materialise_indices(state, index, node);
     case OP_INTEGERS: return eval_materialise_integers(state, index, node);
     case OP_ELEM:    return eval_materialise_elementwise(state, index, node, mode);
     case OP_CHOOSE:  return eval_materialise_choose(state, index, node, mode);
@@ -618,97 +563,186 @@ static int eval_materialise_node(eval_state_t *state, const int index, const eva
     return 1;
 }
 
-// eval_recur_owning_body finds the recurrence whose body is node `body`, returning its
-// index, or -1 when no recurrence reads it.
-//
-// Takes g (dag_t) which is the graph being walked.
-// Takes body (int) which is the recurrence body.
-static int eval_recur_owning_body(const dag_t *g, const int body) {
-    const int count = dag_count(g);
-    for (int i = 0; i < count; i++) {
-        if (dag_at_const(g, i)->carried == body) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-// eval_restart_nested puts every recurrence between `owner` and its body back to zero
-// ticks, so that a nested recurrence restarts with the tick that contains it.
-//
-// The rewind re-materialises every node in that range and eval_materialise_recur puts
-// each recurrence there back to its seed; its tick count has to go back with it, or the
-// inner recurrence sits at its seed for every outer tick after the first and contributes
-// a value it never computed.
-//
-// Takes done (int) which is how many ticks each recurrence has completed.
-// Takes owner (int) which is the recurrence the walk is about to rewind to.
-// Takes body (int) which is that recurrence's body, the last node the rewind re-runs.
-static void eval_restart_nested(int *done, const int owner, const int body) {
-    for (int nested = owner + 1; nested <= body; nested++) {
-        done[nested] = 0;
-    }
-}
-
-// eval_materialise_all materialises every node, iterating each recurrence for the number
-// of steps it declares.
-//
-// The shape is a loop with a rewind: nodes run in index order, and when the node just
-// materialised is some recurrence's body, its value is carried back through
-// eval_element_of, because the body may be fused and that read must happen before the
-// tile cache is dropped. Every live tile is then dropped, because the cache holds values
-// computed from the previous tick's carried value and a tiled traversal would otherwise
-// answer from a stale tile. The rewind happens only while ticks remain, while the
-// carry-back happens on every tick including the last, because the block's value is the
-// carried name after the final tick; committing one fewer time returns the second-to-last
-// value. A recurrence declares its own step count, so the number of rewinds is fixed
-// before the run starts and the evaluation is total.
+// eval_carry_back replaces a recurrence's carry with its completed step result. A fused
+// step can still read the old carry while producing the new column, whose length may
+// differ. Cached tiles can depend on the old carry or tick and expire at this point.
 //
 // Takes state (eval_state_t) which is the evaluation in progress.
-// Takes count (int) which is how many nodes the graph holds.
-// Takes mode (eval_mode_t) which is the traversal to evaluate under.
-// Takes workers (int) which is how many workers the schedule uses.
-static int eval_materialise_all(eval_state_t *state, const int count, const eval_mode_t mode, const int workers) {
-    int *done = (int *) calloc((size_t) (count > 0 ? count : 1), sizeof(int));
-    if (!done) {
+// Takes owner (int) which is the recurrence node that owns the carry.
+// Takes body (int) which is the node holding the step result.
+// Returns zero if the new carry could not be allocated.
+static int eval_carry_back(eval_state_t *state, const int owner, const int body) {
+    const size_t length = state->lengths[body];
+    double *next = malloc(length * sizeof *next);
+    if (!next) {
         return 0;
     }
-
-    for (int i = 0; i < count; i++) {
-        if (!eval_materialise_node(state, i, mode, workers, done)) {
-            free(done); return 0;
-        }
-
-        const int owner = eval_recur_owning_body(state->graph, i);
-        if (owner < 0) {
-            continue;
-        }
-
-        const int steps = (int) dag_at_const(state->graph, owner)->constant;
-        if (done[owner] >= steps) {
-            continue;
-        }
-
-        const size_t length = state->lengths[owner];
-        for (size_t k = 0; k < length; k++) {
-            state->columns[owner][k] = eval_element_of(state, i, k);
-        }
-
-        for (int n = 0; n < count; n++) {
-            state->tile_low[n] = 0;
-            state->tile_high[n] = 0;
-        }
-
-        done[owner]++;
-
-        if (done[owner] < steps) {
-            eval_restart_nested(done, owner, i);
-            i = owner;
+    for (size_t k = 0; k < length; k++) {
+        next[k] = eval_element_of(state, body, k);
+    }
+    free(state->columns[owner]);
+    state->columns[owner] = next;
+    state->lengths[owner] = length;
+    g_column_elements += length;
+    if (state->tiled) {
+        for (int i = 0; i < dag_count(state->graph); i++) {
+            state->tiles[i].high = 0;
         }
     }
-
-    free(done);
     return 1;
+}
+
+// eval_step_count checks the bounds of a recurrence and gives the number of step
+// evaluations it needs. A step with an empty range reuses an existing value on every tick
+// and needs just one copy.
+//
+// Takes node (dagnode_t) which is the recurrence to check.
+// Takes index (int) which is the recurrence's node index.
+// Takes end (int) which is one past the last node in the enclosing range.
+// Takes steps (int) which receives the number of step evaluations on success.
+// Returns zero if the step extends outside the range or its result is unavailable.
+static int eval_step_count(const dagnode_t *node, const int index, const int end, int *steps) {
+    if (node->step_end < index || node->step_end >= end ||
+        node->carried < 0 || node->carried > node->step_end) {
+        return 0;
+    }
+    *steps = node->step_end == index ? 1 : (int) node->constant;
+    return 1;
+}
+
+// eval_prepare_tile allocates enough space for one tile of a deferred producer.
+//
+// Takes state (eval_state_t) which owns the cache.
+// Takes node (int) which selects the producer.
+// Returns zero on allocation failure.
+static int eval_prepare_tile(eval_state_t *state, const int node) {
+    const size_t length = state->lengths[node];
+    const size_t width = state->tile_length < length ? state->tile_length : length;
+    eval_tile_t *tile = &state->tiles[node];
+    if (width <= tile->capacity) {
+        return 1;
+    }
+    if (width > SIZE_MAX / sizeof *tile->values) {
+        return 0;
+    }
+    double *values = realloc(tile->values, width * sizeof *values);
+    if (!values) {
+        return 0;
+    }
+    tile->values = values;
+    tile->capacity = width;
+    return 1;
+}
+
+// eval_prepare_inputs allocates tiles along the paths a worker can read.
+//
+// Takes state (eval_state_t) which owns the private cache.
+// Takes input (int) which selects the operand.
+// Returns zero on allocation failure.
+static int eval_prepare_inputs(eval_state_t *state, const int input) {
+    if (state->columns[input] || state->tiles[input].values) {
+        return 1;
+    }
+    if (!eval_prepare_tile(state, input)) {
+        return 0;
+    }
+    const dagnode_t *node = dag_at_const(state->graph, input);
+    for (int i = 0; i < node->input_count; i++) {
+        if (!eval_prepare_inputs(state, node->in[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// eval_worker_reader prepares a private reader over the parent's immutable fold inputs.
+//
+// Takes reader (eval_state_t) which receives the worker's view.
+// Takes state (eval_state_t) which supplies the shared graph and columns.
+// Takes input (int) which selects the fold operand.
+// Returns zero on allocation failure.
+int eval_worker_reader(eval_state_t *reader, const eval_state_t *state, const int input) {
+    *reader = *state;
+    reader->tiles = NULL;
+    reader->tile_elements = 0;
+    if (!state->tiled || state->columns[input]) {
+        return 1;
+    }
+    reader->tiles = calloc((size_t) dag_count(state->graph), sizeof *reader->tiles);
+    return reader->tiles && eval_prepare_inputs(reader, input);
+}
+
+// eval_release_tiles releases the buffers and bounds owned by one reader.
+//
+// Takes state (eval_state_t) which owns the cache.
+void eval_release_tiles(eval_state_t *state) {
+    if (state->tiles) {
+        for (int i = 0; i < dag_count(state->graph); i++) {
+            free(state->tiles[i].values);
+        }
+        free(state->tiles);
+        state->tiles = NULL;
+    }
+}
+
+// eval_materialise_range evaluates the needed nodes in a half-open range. Each nested
+// recurrence starts at tick zero and finishes before its enclosing step reads the carry.
+//
+// An unused recurrence can contain a node shared by a live expression, so the walk checks
+// each node for use.
+//
+// Takes state (eval_state_t) which is the evaluation in progress.
+// Takes first (int) which is the first node to visit.
+// Takes end (int) which is one past the last node to visit.
+// Takes mode (eval_mode_t) which is the traversal for this run.
+// Takes workers (int) which is the number of workers in the schedule.
+// Takes ticks (int) which holds each recurrence's current tick.
+// Returns zero if evaluation fails or a recurrence has invalid bounds or a missing carry.
+static int eval_materialise_range(eval_state_t *state, const int first, const int end,
+                                  const eval_mode_t mode, const int workers, int *ticks) {
+    for (int i = first; i < end; i++) {
+        if (!state->needed[i]) {
+            continue;
+        }
+        if (!eval_materialise_node(state, i, mode, workers, ticks)
+            || (state->tiled && !state->columns[i] && !eval_prepare_tile(state, i))) {
+            return 0;
+        }
+        const dagnode_t *node = dag_at_const(state->graph, i);
+        if (node->op != OP_RECUR) {
+            continue;
+        }
+        int steps;
+        if (!eval_step_count(node, i, end, &steps)) {
+            return 0;
+        }
+        for (ticks[i] = 0; ticks[i] < steps; ticks[i]++) {
+            if (!eval_materialise_range(state, i + 1, node->step_end + 1, mode, workers, ticks)
+                || !eval_carry_back(state, i, node->carried)) {
+                return 0;
+            }
+        }
+        i = node->step_end;
+    }
+    return 1;
+}
+
+// eval_materialise_all evaluates the graph with fresh tick counters for this run.
+//
+// Takes state (eval_state_t) which is the evaluation in progress.
+// Takes count (int) which is the number of nodes in the graph.
+// Takes mode (eval_mode_t) which is the traversal for this run.
+// Takes workers (int) which is the number of workers in the schedule.
+// Returns zero if allocation or evaluation fails.
+static int eval_materialise_all(eval_state_t *state, const int count, const eval_mode_t mode,
+                                const int workers) {
+    int *ticks = calloc((size_t) count, sizeof *ticks);
+    if (!ticks) {
+        return 0;
+    }
+    const int ok = eval_materialise_range(state, 0, count, mode, workers, ticks);
+    free(ticks);
+    return ok;
 }
 
 // eval_state_init allocates the per-node tables one run needs, for a graph of `count`
@@ -717,6 +751,7 @@ static int eval_materialise_all(eval_state_t *state, const int count, const eval
 // Takes state (eval_state_t) which is the evaluation in progress.
 // Takes g (dag_t) which is the graph being walked.
 // Takes count (int) which is how many nodes the graph holds.
+// Takes result (int) which is the node the caller wants to evaluate.
 // Takes mode (eval_mode_t) which is the traversal to evaluate under.
 // Takes tile (size_t) which is the tile width in elements.
 // Returns 0 if any allocation fails, in which case the partially built state is still
@@ -725,6 +760,7 @@ static int eval_state_init(
     eval_state_t *state,
     const dag_t *g,
     const int count,
+    const int result,
     const eval_mode_t mode,
     const size_t tile
 ) {
@@ -732,22 +768,23 @@ static int eval_state_init(
     state->graph = g;
     state->tiled = (mode == EVAL_TILED);
     state->tile_length = tile;
+    state->needed       = calloc((size_t) count, sizeof *state->needed);
     state->columns      = (double **) calloc((size_t) count, sizeof(double *));
     state->lengths      = (size_t *)  calloc((size_t) count, sizeof(size_t));
-    state->tile_buffers = (double **) calloc((size_t) count, sizeof(double *));
-    state->tile_low     = (size_t *)  calloc((size_t) count, sizeof(size_t));
-    state->tile_high    = (size_t *)  calloc((size_t) count, sizeof(size_t));
-    if (!state->columns || !state->lengths || !state->tile_buffers ||
-        !state->tile_low || !state->tile_high) {
+    if (state->tiled) {
+        state->tiles = calloc((size_t) count, sizeof *state->tiles);
+    }
+    if (!state->needed || !state->columns || !state->lengths || (state->tiled && !state->tiles)) {
         return 0;
     }
-    if (!state->tiled) {
-        return 1;
-    }
-    for (int i = 0; i < count; i++) {
-        state->tile_buffers[i] = (double *) malloc(tile * sizeof(double));
-        if (!state->tile_buffers[i]) {
-            return 0;
+    dag_mark_cone(g, result, state->needed);
+    for (int i = count - 1; i >= 0; i--) {
+        const dagnode_t *node = dag_at_const(g, i);
+        if (node->op == OP_SOURCE && node->bless > 0) {
+            state->needed[i] = 1;
+        }
+        if (state->needed[i] && node->op == OP_TICK) {
+            dag_mark_cone(g, node->tick_of, state->needed);
         }
     }
     return 1;
@@ -763,67 +800,114 @@ static void eval_state_free(eval_state_t *state, const int count) {
         if (state->columns) {
             free(state->columns[i]);
         }
-        if (state->tile_buffers) {
-            free(state->tile_buffers[i]);
-        }
     }
+    free(state->needed);
     free(state->columns);
     free(state->lengths);
-    free(state->tile_buffers);
-    free(state->tile_low);
-    free(state->tile_high);
+    eval_release_tiles(state);
 }
 
-// eval_dag_in_world executes the graph under one traversal, tile width and worker count,
-// writing the result's value through `out`.
+// eval_collect_result transfers a materialised column to the caller. For a fused or tiled
+// result it reads the elements while their operands are still live.
 //
-// The answer is read through eval_element_of rather than off the result's column, because
-// a node that materialises only under EVAL_MATERIALISE has no column under the other two
-// traversals, and the one-input wrappers OP_OPAQUE and OP_DEMAND have that shape;
-// requiring a column here would make a program whose result is a wrapper fail to evaluate
-// under fusion and tiling.
-//
-// Takes g (dag_t) which is the graph being walked.
+// Takes state (eval_state_t) which owns the evaluated columns.
 // Takes result (int) which is the node the program returns.
-// Takes mode (eval_mode_t) which is the traversal to evaluate under.
-// Takes tile (size_t) which is the tile width in elements.
-// Takes workers (int) which is how many workers the schedule uses.
-// Takes world (unsigned) which selects what an external source hands back.
-// Takes out (double) which receives the answer.
-// Returns 0 when the run could not produce it.
-int eval_dag_in_world(
-    const dag_t *g, const int result, const eval_mode_t mode, const size_t tile,
-    const int workers, const unsigned world, double *out
-) {
-    const int count = dag_count(g);
-    if (count <= 0 || result < 0 || result >= count) {
-        return 0;
+// Returns a column owned by the caller, or an empty result if allocation fails.
+static eval_result_t eval_collect_result(eval_state_t *state, const int result) {
+    const size_t length = state->lengths[result];
+    double *values = state->columns[result];
+    if (values) {
+        state->columns[result] = NULL;
+    } else {
+        values = malloc(length * sizeof *values);
+        if (!values) {
+            return (eval_result_t) {0};
+        }
+        for (size_t k = 0; k < length; k++) {
+            values[k] = eval_element_of(state, result, k);
+        }
     }
-    const size_t tile_width = tile < 1 ? 1 : tile;
+    return (eval_result_t) { .values = values, .length = length };
+}
 
+// eval_graph evaluates the result under the given schedule, input world and kernel order.
+//
+// Takes g (dag_t) which is the graph to evaluate.
+// Takes result (int) which is the node the program returns.
+// Takes mode (eval_mode_t) which is the traversal for this run.
+// Takes tile (size_t) which is the tile width in elements.
+// Takes workers (int) which is the number of workers in the schedule.
+// Takes world (unsigned) which selects the input data for external sources.
+// Takes reference (int) which selects serial combining kernels when non-zero.
+// Returns a column owned by the caller, or an empty result on failure.
+static eval_result_t eval_graph(const dag_t *g, const int result, const eval_mode_t mode,
+                                const size_t tile, const int workers, const unsigned world,
+                                const int reference) {
+    const int count = dag_count(g);
+    eval_result_t output = {0};
     g_column_elements = 0;
     g_tile_elements = 0;
+    g_replay_workers = 0;
+    if (result < 0 || result >= count) {
+        return output;
+    }
 
     eval_state_t state;
-    int ok = eval_state_init(&state, g, count, mode, tile_width);
-    if (ok) {
+    if (eval_state_init(&state, g, count, result, mode, tile < 1 ? 1 : tile)) {
         state.world = world;
+        state.reference = reference;
+        if (eval_materialise_all(&state, count, mode, workers)) {
+            output = eval_collect_result(&state, result);
+        }
     }
-    if (ok) {
-        ok = eval_materialise_all(&state, count, mode, workers);
-    }
-    if (ok) {
-        *out = eval_element_of(&state, result, 0);
-    }
+    g_tile_elements = state.tile_elements;
+    g_replay_workers = state.replay_workers;
     eval_state_free(&state, count);
-    return ok;
+    return output;
+}
+
+// eval_run evaluates the whole result in world 1 with one worker and materialised
+// columns.
+//
+// Takes g (dag_t) which is the graph to evaluate.
+// Takes result (int) which is the node the program returns.
+// Returns a column owned by the caller, or an empty result on failure.
+eval_result_t eval_run(const dag_t *g, const int result) {
+    return eval_graph(g, result, EVAL_MATERIALISE, 1, 1, 1u, 0);
+}
+
+// eval_take_scalar extracts a single value for a schedule or reference comparison.
+//
+// Takes result (eval_result_t) which owns the column and is consumed on every path.
+// Takes out (double) which receives the value if the column has one element.
+// Returns one if a value was written, zero otherwise.
+static int eval_take_scalar(eval_result_t result, double *out) {
+    if (result.length == 1) {
+        *out = result.values[0];
+    }
+    free(result.values);
+    return result.length == 1;
+}
+
+// eval_dag_in_world evaluates a scalar result under a given schedule and input world.
+//
+// Takes g (dag_t) which is the graph to evaluate.
+// Takes result (int) which is the node the program returns.
+// Takes mode (eval_mode_t) which is the traversal for this run.
+// Takes tile (size_t) which is the tile width in elements.
+// Takes workers (int) which is the number of workers in the schedule.
+// Takes world (unsigned) which selects the input data for external sources.
+// Takes out (double) which receives the scalar on success.
+// Returns zero if evaluation fails or the result does not have exactly one element.
+int eval_dag_in_world(const dag_t *g, const int result, const eval_mode_t mode, const size_t tile,
+                      const int workers, const unsigned world, double *out) {
+    return eval_take_scalar(eval_graph(g, result, mode, tile, workers, world, 0), out);
 }
 
 // eval_dag evaluates `g` in the shipped world.
 //
-// Every schedule this evaluator varies leaves the world alone, so a lane can be a claim
-// about pairs of runs with the inputs held equal; a check that wants to vary the world
-// instead calls eval_dag_in_world directly, and what it measures is the other axis.
+// Schedule comparisons use the same input world on both sides. A check that varies the
+// inputs calls eval_dag_in_world directly.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
@@ -839,35 +923,11 @@ int eval_dag(const dag_t *g, const int result, const eval_mode_t mode, const siz
 // eval_dag_on_reference evaluates `g` with every combining kernel replaced by the serial
 // order, and writes the result scalar to `out`.
 //
-// Materialised, one worker, no tiling: the reference is not a deployment schedule, so it
-// is evaluated at the point of the schedule space where nothing has been chosen.
+// The reference uses materialised columns, one worker and serial combining order.
 //
 // Takes g (dag_t) which is the graph being walked.
 // Takes result (int) which is the node the program returns.
 // Takes out (double) which receives the answer.
 int eval_dag_on_reference(const dag_t *g, const int result, double *out) {
-    const int count = dag_count(g);
-    if (count <= 0 || result < 0 || result >= count) {
-        return 0;
-    }
-
-    g_column_elements = 0;
-    g_tile_elements = 0;
-
-    eval_state_t state;
-    int ok = eval_state_init(&state, g, count, EVAL_MATERIALISE, 1);
-    if (ok) {
-        state.world = 1u; state.reference = 1;
-    }
-    if (ok) {
-        ok = eval_materialise_all(&state, count, EVAL_MATERIALISE, 1);
-    }
-    if (ok && state.columns[result]) {
-        memcpy(out, state.columns[result], sizeof(double));
-    }
-    else {
-        ok = 0;
-    }
-    eval_state_free(&state, count);
-    return ok;
+    return eval_take_scalar(eval_graph(g, result, EVAL_MATERIALISE, 1, 1, 1u, 1), out);
 }

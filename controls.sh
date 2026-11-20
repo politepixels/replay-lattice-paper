@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+#
 # Usage:
 #   ./controls.sh          run every control and print the verdict
 #   ./controls.sh --list   print the roster and exit
@@ -42,11 +42,11 @@ weak=0
 # How many controls could not run here.
 skipped=0
 
-# How many controls made their break materialise and watched the gate accept it.
+# How many controls reported DID-NOT-FIRE.
 dead=0
 
-# The roster: one row per control, as id, the check it guards, whether it breaks a build, and the
-# break in one line.
+# Each roster row gives the control ID, the check it guards, whether it breaks a build and a
+# description of the break.
 CONTROLS=(
   "CC1|L3|y|the grounding judgement removed, so a demand over an external source is accepted"
   "CC2|L2|y|the fixed tree's bracketing made to follow the worker count, so the row that says its bits are a function of (data, shape) stops being true"
@@ -69,8 +69,7 @@ CONTROLS=(
   "CC19|L3|y|an ungrounded declaration made to state nothing, so a value the program does not fix reads as one it does"
 )
 
-# print_usage prints this file's own header block: every comment line after the shebang, stopping at
-# the first line that is not a comment.
+# print_usage prints the header comments immediately following the shebang.
 # Outputs:
 #   The header comment block on stdout
 print_usage() {
@@ -83,7 +82,7 @@ print_usage() {
 # Arguments:
 #   $@ - The command line
 # Outputs:
-#   The header block on stdout for --help; a complaint on stderr for anything unrecognised
+#   The header on stdout for --help or an error on stderr for an unrecognised option
 # Returns:
 #   Exits 0 after --help and exits 2 on an unrecognised argument, otherwise 0
 parse_arguments() {
@@ -127,12 +126,14 @@ print_roster() {
          "$(count_roster_rows n) assert on the shipped binary."
 }
 
-# lanelang_core_sources prints the checker's core translation units, read from the one place
-# that list is maintained.
-#
-# CONVENTIONS.md section 0 freezes the `CORE :=` line's layout, because this function parses it.
+# A shorter source list indicates that the Makefile entry could not be read in full.
 CORE_SOURCE_FLOOR=9
 
+# lanelang_core_sources reads the source filenames from the Makefile's single `CORE :=` line.
+# Outputs:
+#   The space-separated filenames on stdout
+# Returns:
+#   1 if the parsed list contains fewer than CORE_SOURCE_FLOOR filenames
 lanelang_core_sources() {
     local list
     list="$(sed -n 's/^CORE[[:space:]]*:=[[:space:]]*//p' "$ROOT/src/lanelang/Makefile")"
@@ -142,15 +143,16 @@ lanelang_core_sources() {
     printf '%s' "$list"
 }
 
-# report prints one control's outcome row and adds it to the tally.
+# report buffers one control's outcome for the final table and adds it to the tally.
 # Globals:
+#   CONTROL_ROWS - Appended with the formatted row
 #   fired, weak, skipped, dead - Incremented according to the outcome
 # Arguments:
-#   $1 - The control id
+#   $1 - The control ID
 #   $2 - FIRED, WEAK, SKIP or DID-NOT-FIRE
 #   $3 - The note explaining the outcome
 # Outputs:
-#   One fixed-width row on stdout
+#   An error on stderr for an unknown outcome
 # Returns:
 #   Exits 2 when the outcome is not one of the four
 report() {
@@ -168,9 +170,8 @@ report() {
 
 # control_cc1_grounding_removed requires the grounding judgement to decide verdicts.
 #
-# The break drops it, so a demand whose cone reaches an external source is accepted on its
-# schedule history alone. Every lane in such a program is correct, so no lane assertion can see
-# the break, and grounding has to be a judgement of its own beside the lane.
+# The affected fixtures satisfy their lane demands but depend on ungrounded inputs. Removing
+# the grounding judgement lets those demands pass.
 # Arguments:
 #   $1 - The fixture directory
 control_cc1_grounding_removed() {
@@ -192,7 +193,7 @@ control_cc1_grounding_removed() {
 }
 
 # control_cc2_schedule_dependent_tree requires L2 to reject a fixed-tree kernel that reads the
-# schedule.
+# schedule. The substitution targets the definition of kernel_fixed_tree by name.
 control_cc2_schedule_dependent_tree() {
     local status reason
     if ! command -v coqc >/dev/null 2>&1; then
@@ -200,12 +201,11 @@ control_cc2_schedule_dependent_tree() {
         return
     fi
     mkdir -p "$WORK/proofs-eval"
-    if ! cp "$ROOT/src/proofs/ReplayLattice.v" "$WORK/proofs-eval/ReplayLattice.v" ||
-       ! cp "$ROOT/src/proofs/ReplayLatticeEval.v" "$WORK/proofs-eval/ReplayLatticeEval.v"; then
+    if ! cp "$ROOT/src/proofs/ReplayLattice.v" "$ROOT/src/proofs/ReplayLatticeEval.v" \
+            "$ROOT/src/proofs/ScalarRecurrence.v" "$WORK/proofs-eval/"; then
         report CC2 SKIP "could not copy the development"
         return
     fi
-    # Anchored on the definition rather than on its body, for the reason CC16's substitution is.
     perl -0pi -e 's/(Definition kernel_fixed_tree \(s : msched\) \(l : list A\) : A :=)\s*blocked EVAL_BLOCK l\./$1 blocked (S (sworkers s)) l./s' \
         "$WORK/proofs-eval/ReplayLatticeEval.v"
     if ! grep -q 'kernel_fixed_tree (s : msched) (l : list A) : A := blocked (S (sworkers s)) l' \
@@ -229,13 +229,11 @@ control_cc2_schedule_dependent_tree() {
 
 # control_cc3_scan_width_follows_workers requires the blocked scan's leaf width to be frozen.
 #
-# The width is published ABI in the same sense the reduction tree's is: two implementations agree
-# on a `replay` scan's bits only if they agree on it. The break lets the deployment pick it, the
-# same defect as a tree whose shape follows the worker count.
+# The replay scan in this artefact uses a fixed block width. This control lets the worker
+# count pick the width.
 #
-# A kernel that accumulates across block boundaries computes a serial scan, so its width reaches no
-# bit, the invariance leg passes under the break, and this control cannot fire. A control that
-# cannot fire here points at that kernel.
+# If the scan carries a single serial accumulator through every block, changing the width
+# leaves the grouping unchanged. The control looks for a pinned result that moves.
 control_cc3_scan_width_follows_workers() {
     local broken="$ROOT/build/bin/test_schedule_scanblock" status reason pinned_count unpinned_count
     if [ ! -x "$broken" ]; then
@@ -263,16 +261,9 @@ control_cc3_scan_width_follows_workers() {
 # control_cc4_exact_lowers_to_the_tree requires the reference comparison to catch `exact`
 # discharged by the fixed tree instead of the oracle order.
 #
-# No other gate sees this break. The fixed tree is schedule-invariant, so the perturbed build still
-# shows one bit pattern over the twenty traversal and worker cells for each pinned lane, and every
-# invariance assertion passes. The fixed tree is not the serial reference, so a value declared
-# `exact` has one meaning under this build and another under the shipped one: one lane, two bit
-# patterns.
-#
-# If the leg fails for any reason other than reference inequality, the reference comparison has not
-# been shown to be separate evidence, and the control reports WEAK. It therefore reads the leg's
-# declared reason, not its exit status, and requires the schedule assertions to stay green: the
-# count of `1 pattern over` lines must not fall.
+# The fixed tree can give the same bits on all twenty schedules and still differ from the serial
+# reference. L4 must report that difference. The control counts the passing schedule-invariance
+# checks in both builds to ensure that the perturbed build still passes as many as the shipped one.
 control_cc4_exact_lowers_to_the_tree() {
     local broken="$ROOT/build/bin/test_schedule_exacttree" shipped="$ROOT/build/bin/test_schedule"
     local out reason invariant_before invariant_after
@@ -290,7 +281,7 @@ control_cc4_exact_lowers_to_the_tree() {
     elif [ "$invariant_after" -lt "$invariant_before" ]; then
         report CC4 WEAK "the reference comparison fired, but $((invariant_before - invariant_after)) schedule-invariance assertion(s) fired too, so this break is visible without it"
     else
-        report CC4 FIRED "the fixed tree discharged exact with all $invariant_after schedule-invariance assertion(s) still green; only the reference comparison saw it"
+        report CC4 FIRED "the fixed tree differed from the serial reference while all $invariant_after schedule-invariance checks passed"
     fi
 }
 
@@ -339,15 +330,16 @@ control_cc6_malformed_is_not_a_lane_verdict() {
 # answer from a program the checker refused.
 control_cc7_pinned_eval_breaks() {
     local status reason broken_count unpinned_count
-    local core
-    if ! core="$(lanelang_core_sources)"; then
+    local core_line
+    local -a core
+    if ! core_line="$(lanelang_core_sources)"; then
         report CC7 DID-NOT-FIRE \
             "src/lanelang/Makefile's CORE := line no longer parses, so the broken-evaluator variant could not be built"
         return
     fi
-    # shellcheck disable=SC2086
-    if ! ( cd "$ROOT/src/lanelang" && "${CC:-cc}" -O2 -std=c11 -DRL_PINNED_EVAL_BREAKS -I. \
-            -o "$WORK/ts_pinnedeval" test_schedule.c $core ) >"$WORK/cc7.build" 2>&1; then
+    read -r -a core <<< "$core_line"
+    if ! ( cd "$ROOT/src/lanelang" && "${CC:-cc}" -O2 -std=c11 -pthread -ffp-contract=off -DRL_PINNED_EVAL_BREAKS -I. \
+            -o "$WORK/ts_pinnedeval" test_schedule.c "${core[@]}" ) >"$WORK/cc7.build" 2>&1; then
         report CC7 SKIP "could not build the broken-evaluator variant"
         return
     fi
@@ -369,8 +361,9 @@ control_cc7_pinned_eval_breaks() {
     fi
 }
 
-# control_cc8_checker_kill_switch requires the kill switch to suppress every verdict, to leave a
-# malformed program malformed, and to change no kernel pick.
+# control_cc8_checker_kill_switch checks that the switch suppresses rejections in the entry
+# point and an uncalled declaration, preserves a structural error and keeps the same kernel
+# choices for the rejected entry point.
 # Arguments:
 #   $1 - The checker binary
 #   $2 - The fixture directory
@@ -400,14 +393,11 @@ control_cc8_checker_kill_switch() {
 # control_cc9_qualifiers_unreserved requires the lane qualifiers to be reserved words.
 #
 # The break makes them ordinary identifiers and decides the prefix by lookahead, so a qualifier
-# with a name after it is still a qualifier and one without becomes a name. The second case is the
-# defect: `replay := sum(x)` binds a variable called `replay`, the demand it plainly means is never
-# stated, no diagnostic is printed, and the free kernel is selected.
+# with a name after it is still a qualifier and one without becomes a name. Under the break,
+# `replay := sum(x)` binds a variable called `replay` and selects the free kernel without a
+# diagnostic.
 #
-# The break fails open on a demand: a demand the source plainly writes is dropped without a word.
-#
-# The assertion has two arms. The fixture must flip to accept, and the diagnostic must vanish with
-# it; a build that still refused for another reason would prove nothing about this break.
+# The control fires when the checker accepts the fixture and the qualifier diagnostic disappears.
 # Arguments:
 #   $1 - The fixture directory
 control_cc9_qualifiers_unreserved() {
@@ -432,14 +422,11 @@ control_cc9_qualifiers_unreserved() {
 # control_cc10_bless_flips_grounded requires a blessing to excuse a declaration without repairing
 # the cone underneath it.
 #
-# The break marks a blessed leaf grounded instead. It changes no verdict: every fixture accepts and
-# rejects as it does in a shipped build, because a declaration excused by the disjunct and one
-# resting on a repaired cone are accepted by the same rule. What moves is the count of nodes the
-# sweep left ungrounded, which the fixtures assert, so no accept-or-reject assertion can see this
-# break.
+# The break marks a blessed leaf grounded. Every fixture keeps its verdict because the same rule
+# accepts an excused declaration and one resting on a repaired cone. The fixtures distinguish
+# the two by counting the nodes the sweep leaves ungrounded.
 #
-# If the leg fails but no `ungrounded nodes` line appears, something else caught the break and the
-# control reports WEAK; if any verdict moved, the break was not the one described.
+# The control reports WEAK if the failure omits the ungrounded-node count or any verdict changes.
 # Arguments:
 #   $1 - The fixture directory
 control_cc10_bless_flips_grounded() {
@@ -488,17 +475,14 @@ control_cc11_ordered_aliases_exact() {
 # control_cc12_demand_stamps_node requires a demand to be carried on a node of its own.
 #
 # The break stamps the demand onto the value instead. `declared` is in the interning key, so the
-# stamp lands after the node has been offered for interning: which twins merge is then decided by
-# the order two independent bindings were written in, and a demand reaches values the source
-# demanded nothing about.
+# stamp lands after the node has been offered for interning. The order of two independent
+# bindings then decides which twins merge, and the demand reaches other uses of the same value.
 #
-# The fixture that notices is the one about a promise read in a wider expression. Under the break
-# the demand and the outside reader are the same node, so escape-marking refuses
-# `return f(x) + 1.0`. Carried on its own node, the escaping reader reads a neutral wrapper and the
-# producer beneath it never escaped, so a promise needs no exemption from the escape rule.
+# In the fixture with `return f(x) + 1.0`, the addition reads the promised result. Under the
+# break it reads the producer directly, so the producer escapes and cannot be pinned. In the
+# shipped graph the addition reads a demand wrapper, which keeps the producer private.
 #
-# The assertion has two arms. A verdict must move, or the node bought nothing; and the fold must
-# lose its kernel, or something other than the stamping did the work.
+# The control requires both a changed verdict and a fold that loses its pinned kernel.
 # Arguments:
 #   $1 - The fixture directory
 control_cc12_demand_stamps_node() {
@@ -523,14 +507,9 @@ control_cc12_demand_stamps_node() {
 # control_cc13_demand_picks_the_kernel requires the discharge to follow the operation, never the
 # demand.
 #
-# The break is the choice a production compiler made: let the lane written at a node select the
-# kernel. Every fixture still reaches the outcome it expects, so no accept-or-reject assertion can
-# see the break, and one computed class would emit two bit patterns. The invariant sweep over the
-# (class x demand x ambient) product catches it, and no fixture fails under this build, so deleting
-# the sweep would leave the break undetected.
-#
-# The receipt asserts the verdict half as well: a receipt saying no verdict moved, while measuring
-# only that something rejected, would claim more than it checked.
+# The break lets the written demand select a different kernel for the same operation class.
+# The control looks for the kernel sweep's failure and checks that no fixture switched
+# between acceptance and rejection. It reads the receipt and diagnostics together.
 # Arguments:
 #   $1 - The fixture directory
 control_cc13_demand_picks_the_kernel() {
@@ -539,8 +518,6 @@ control_cc13_demand_picks_the_kernel() {
         report CC13 SKIP "the demand-driven build is absent, so the invariant cannot be broken"
         return
     fi
-    # 2>&1 keeps both streams: the harness prints its RL-STATUS line to stdout and every FAIL detail
-    # to stderr, so a control that discards stderr can see the leg fail and not see what caught it.
     line="$("$broken" "$fixtures" 2>&1)"
     status="$(printf '%s\n' "$line" | sed -n 's/.*result=\([A-Z-]*\).*/\1/p' | tail -1)"
     verdicts="$(printf '%s\n' "$line" | grep -c 'kernel selection reads the demand' || true)"
@@ -559,15 +536,16 @@ control_cc13_demand_picks_the_kernel() {
 # control_cc14_tiling_that_rebrackets requires L4 to reject a tile width deciding the bracketing.
 control_cc14_tiling_that_rebrackets() {
     local status reason pinned_count unpinned_count
-    local core
-    if ! core="$(lanelang_core_sources)"; then
+    local core_line
+    local -a core
+    if ! core_line="$(lanelang_core_sources)"; then
         report CC14 DID-NOT-FIRE \
             "src/lanelang/Makefile's CORE := line no longer parses, so the rebracketing variant could not be built"
         return
     fi
-    # shellcheck disable=SC2086
-    if ! ( cd "$ROOT/src/lanelang" && "${CC:-cc}" -O2 -std=c11 -DRL_TILE_REBRACKETS -I. \
-            -o "$WORK/ts_rebracket" test_schedule.c $core ) >"$WORK/cc14.build" 2>&1; then
+    read -r -a core <<< "$core_line"
+    if ! ( cd "$ROOT/src/lanelang" && "${CC:-cc}" -O2 -std=c11 -pthread -ffp-contract=off -DRL_TILE_REBRACKETS -I. \
+            -o "$WORK/ts_rebracket" test_schedule.c "${core[@]}" ) >"$WORK/cc14.build" 2>&1; then
         report CC14 SKIP "could not build the rebracketing variant"
         return
     fi
@@ -592,15 +570,16 @@ control_cc14_tiling_that_rebrackets() {
 # control_cc15_ordering_guard requires L7 to reject a sweep that answers what it cannot analyse.
 control_cc15_ordering_guard() {
     local status reason answered_count mismatch_count
-    local core
-    if ! core="$(lanelang_core_sources)"; then
+    local core_line
+    local -a core
+    if ! core_line="$(lanelang_core_sources)"; then
         report CC15 DID-NOT-FIRE \
             "src/lanelang/Makefile's CORE := line no longer parses, so the fail-open variant could not be built"
         return
     fi
-    # shellcheck disable=SC2086
-    if ! ( cd "$ROOT/src/lanelang" && "${CC:-cc}" -O2 -std=c11 -DRL_LATTICE_ORDER_FAILOPEN -I. \
-            -o "$WORK/fuzz_failopen" fuzz.c $core oracle.c ) >"$WORK/cc15.build" 2>&1; then
+    read -r -a core <<< "$core_line"
+    if ! ( cd "$ROOT/src/lanelang" && "${CC:-cc}" -O2 -std=c11 -pthread -ffp-contract=off -DRL_LATTICE_ORDER_FAILOPEN -I. \
+            -o "$WORK/fuzz_failopen" fuzz.c "${core[@]}" oracle.c ) >"$WORK/cc15.build" 2>&1; then
         report CC15 SKIP "could not build the fail-open variant"
         return
     fi
@@ -682,14 +661,9 @@ control_cc17_healing_disabled() {
 # control_cc18_bless_on_any_node requires the restriction of @bless to a source or an `ungrounded`
 # call to be enforced.
 #
-# The restriction is a structural side condition, not a production, and the break drops it. A
-# waiver on a fold parses in every build: bless_is_legal_here asks the graph whether the value is a
-# source or a call declared `ungrounded`, and refuses it with a written diagnostic when it is not.
-# The question is about the graph, asked where the graph exists, so the rule lives in resolve.c
-# and the break removes it there.
-#
-# A blessing says the bytes behind an external source will be the same next run, and a fold has no
-# bytes behind it, so the fixture that must notice is a malformed one, not a rejection.
+# A waiver on a fold parses in both builds. During resolution, bless_is_legal_here checks
+# the lowered node and reports a structural error for a fold. The control bypasses this
+# check and looks for a failure in the fixture that expects the program to be malformed.
 # Arguments:
 #   $1 - The fixture directory
 control_cc18_bless_on_any_node() {
@@ -712,14 +686,11 @@ control_cc18_bless_on_any_node() {
 
 # control_cc19_opaque_is_grounded requires an `ungrounded` declaration to carry a grounding answer.
 #
-# The break makes the opaque wrapper state GROUND_FIXED like any other node, so the declaration
-# still parses, still lowers and still builds the same graph, and says nothing. A body the program
-# fixes then reads as grounded at the call site, which the qualifier exists to deny.
+# The break gives the opaque wrapper an initial grounding of GROUND_FIXED. When the body
+# is fixed, its result then reads as grounded at the call site despite the declaration.
 #
-# The assertion has two arms. A verdict must move, or the declaration stated nothing already; and
-# the ungrounded-node counts must fall, or something other than the grounding bit did the work. The
-# wrapper is still built under the break, so a change in the graph's shape cannot be mistaken for
-# the property under test.
+# The control looks for a rejection that became an acceptance and a fixture reporting a
+# changed ungrounded-node count. The wrapper is still built under the break.
 # Arguments:
 #   $1 - The fixture directory
 control_cc19_opaque_is_grounded() {
@@ -742,11 +713,11 @@ control_cc19_opaque_is_grounded() {
 }
 
 
-# build_checker builds the checker and every control variant of it.
+# build_checker builds the checker and the variants in the Makefile's controls target.
 # Globals:
 #   ROOT, WORK - Read
 # Returns:
-#   0 when the checker and its variants built, 1 otherwise
+#   0 when make succeeds and the checker is executable, non-zero otherwise
 build_checker() {
     make -C "$ROOT/src/lanelang" all controls >"$WORK/lanelang.build" 2>&1 \
         && [ -x "$ROOT/build/bin/lanelang" ]
@@ -759,8 +730,8 @@ print_table_header() {
     echo "----------------------------------------------------------"
 }
 
-# run_every_control runs the whole roster in id order. Every control but CC2 and CC16 needs the
-# checker, so when it does not build those seventeen report SKIP and the two proof controls run.
+# run_every_control runs the roster in ID order after a successful build. If the build fails,
+# it records skips for the seventeen C controls and still runs the two proof controls.
 # Globals:
 #   ROOT - Read
 run_every_control() {

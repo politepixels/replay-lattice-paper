@@ -14,19 +14,13 @@
 #include <cub/device/device_reduce.cuh>
 #include <cuda/__execution/require.h>
 
-// The execution namespace holding `require`.
 namespace ex  = cuda::execution;
 
-// The namespace holding the determinism guarantees themselves.
 namespace det = ex::determinism;
 
-// compose reduces `in` into `mid` under no determinism guarantee, then reduces `mid` into `out`
-// under a guarantee of run-to-run determinism.
 void compose(float *in, float *mid, float *out) {
-    // Produced under a schedule nobody pinned.
     (void) cub::DeviceReduce::Reduce(in, mid, 100, cuda::std::plus<float>{}, 0.0f,
                                      ex::require(det::not_guaranteed));
-    // Consumed where run-to-run determinism is required. Neither call produces a diagnostic.
     (void) cub::DeviceReduce::Reduce(mid, out, 1, cuda::std::plus<float>{}, 0.0f,
                                      ex::require(det::run_to_run));
 }

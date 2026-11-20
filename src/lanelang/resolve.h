@@ -25,10 +25,8 @@ typedef enum {
     // RESOLVE_OK is the program lowered, the graph and the result index both usable.
     RESOLVE_OK = 0,
 
-    // RESOLVE_MALFORMED is a structural defect, an undefined name, a self reference or a
-    // call to a function that does not exist, kept separate from a lane verdict because
-    // "your program is not well formed" and "your program violates a determinism demand"
-    // are different answers.
+    // RESOLVE_MALFORMED means lowering failed. An undefined name, an invalid call or an
+    // allocation failure can produce this status.
     RESOLVE_MALFORMED = 1
 } resolve_status_t;
 
@@ -46,7 +44,8 @@ typedef struct {
     int result;
 } resolved_t;
 
-// resolve_program lowers `entry` and everything it calls into one DAG.
+// resolve_program lowers `entry` and everything it calls into one DAG. Its source labels
+// and spans borrow the same source text and file name as the parsed program.
 //
 // Takes program (program_t) which is the parsed program.
 // Takes entry (char) which names the function to lower.
@@ -54,8 +53,8 @@ typedef struct {
 resolved_t resolve_program(program_t *program, const char *entry, diagnostic_t *diagnostics);
 
 // resolve_verify_declarations lowers, heals and lane-checks every function other than the
-// entry on a lowering of its own, so a published return lane and every demand written inside
-// a body are verified whether or not anything calls them.
+// entry on a lowering of its own, so a published return lane and every demand written
+// inside a body are verified whether or not anything calls them.
 //
 // Takes program (program_t) which is the parsed program.
 // Takes entry (char) which is the entry function's name, skipped because it is lowered

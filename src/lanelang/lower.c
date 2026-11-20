@@ -12,23 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "dag.h"
 #include "lower.h"
+
+#include "dag.h"
 
 #include <stdio.h>
 
-// UNNAMED_FOLD_LABEL is what an unnamed fold is printed as: a fold with no binding still
-// needs a name in the transcript a check reads back, and `sum` is what the source would
-// have called it.
+// UNNAMED_FOLD_LABEL supplies the fallback name in the kernel transcript when a fold or
+// scan has no binding label.
 #define UNNAMED_FOLD_LABEL     "sum"
 
 // lower_kernel_for is the name of the kernel a fold or scan node lowers to, or NULL for a
 // node that is neither.
 //
-// The discharge is chosen by the operation, never by the demand: this function reads
-// `op_class`, and not `declared`, the lane the sweep computed, or the ambient. This makes
-// a lane a function of the bits rather than the other way round, and it is the invariant
-// lower_kernel_demand_free_cases asserts.
+// The shipped mapping reads the operation and its schedule class. A change to the stated
+// demand or construction lane alone must leave the kernel name unchanged.
+// lower_kernel_demand_free_cases checks this property.
 //
 // Takes node (dagnode_t) which is the node under examination.
 const char *lower_kernel_for(const dagnode_t *node) {
@@ -57,8 +56,8 @@ const char *lower_kernel_for(const dagnode_t *node) {
 // kernel_is_demand_free sweeps every (demand x ambient) pair over one probe and reports
 // how many agreed with `expected`, or 0 as soon as one did not.
 //
-// Takes probe (dagnode_t) which is the node whose class is under test; its lane fields
-// are overwritten.
+// Takes probe (dagnode_t) which holds the class under test and receives each pair of lane
+// fields.
 // Takes lanes (lane_t) which is the set of lanes to sweep, including LANE_NONE.
 // Takes lane_count (size_t) which is how many entries `lanes` has.
 // Takes expected (char) which is the kernel the class alone selects.
@@ -80,16 +79,13 @@ static int kernel_is_demand_free(dagnode_t *probe, const lane_t *lanes, const si
     return cases;
 }
 
-// lower_kernel_demand_free_cases checks that the kernel a fold lowers to does not depend
-// on the demand written at it, and returns the number of (class, demand, ambient) triples
-// checked, or 0 if the invariant is broken.
+// lower_kernel_demand_free_cases checks demand-independent kernel selection for folds and
+// scans. It returns the number of (class, demand, ambient) triples checked, or zero on a
+// mismatch.
 //
-// It holds `op_class` fixed, sweeps `declared` and `lane` over every value the chain
-// admits, and requires the selected kernel to be byte-identical throughout, so a build
-// that lets either field reach the selection returns 0. The failure it catches is
-// invisible to a verdict, because a demand-driven discharge accepts the same programs and
-// emits different bits. The op has to match the class, or a scan class would be asked
-// through the fold arm and the sweep would compare a kernel neither family emits.
+// The check holds `op_class` fixed and varies `declared` and `lane`, including the absent
+// lane. It compares the reported kernel name for each combination. Scan classes use a
+// scan probe so they exercise the scan mapping.
 int lower_kernel_demand_free_cases(void) {
     static const opclass_t classes[] = {
         OPC_NEUTRAL, OPC_FOLD_EXACT, OPC_FOLD_INTEGER, OPC_FOLD_REPLAY, OPC_FOLD_APPROX,

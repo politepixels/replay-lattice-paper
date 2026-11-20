@@ -37,9 +37,8 @@ static expr_t *parse_new_expr(parser_t *parser, const expr_kind_t kind, const sp
 // parse_argument_label reads an argument's `name:` label into `argument` if the next
 // tokens are one, and leaves the argument positional if they are not.
 //
-// One token of lookahead cannot tell a label from a bare identifier, since both begin
-// with an identifier, so the parser state is saved and put back when the colon does not
-// arrive.
+// If the next token is not a colon, the positional argument parser reads it again. The
+// lookahead restores both the cursor and the diagnostic sink.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes argument (arg_t) which is the argument expression.
@@ -48,11 +47,14 @@ static void parse_argument_label(parser_t *parser, arg_t *argument) {
         return;
     }
     const parser_t saved = *parser;
+    const int mark = diagnostic_mark(parser->diagnostics);
     const char *label = parser->token.text;
     const int label_length = parser->token.length;
     parse_advance(parser);
     if (parser->token.kind != TK_COLON) {
-        *parser = saved; return;
+        *parser = saved;
+        diagnostic_rewind(parser->diagnostics, mark);
+        return;
     }
     parse_advance(parser);
     argument->label = label;
@@ -65,14 +67,12 @@ static void parse_argument_label(parser_t *parser, arg_t *argument) {
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static expr_t *parse_lambda(parser_t *parser);
 
-// parse_argument_value reads one argument's value: a step function after a `with:` label,
-// and an ordinary expression after every other.
+// parse_argument_value reads a step function after a `with:` label and an ordinary
+// expression for every other argument.
 //
-// A step function may follow only a `with:` label, so `(acc, t) => e` is parsed here and
-// nowhere else, and the same text in any other position is a syntax error. That keeps a
-// step out of the value grammar: no production reaches it, so it cannot be bound,
-// returned or put in a column. A `with:` written on a call with no use for one is refused
-// when that call is lowered, because the callee is known there.
+// Only a `with:` argument admits the syntax `(acc, t) => e`. A step cannot appear as a
+// binding's value, a return value or a column element. The resolver checks whether the
+// callee accepts a step.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes argument (arg_t) which is the argument whose label has been read.
@@ -83,8 +83,7 @@ static expr_t *parse_argument_value(parser_t *parser, const arg_t *argument) {
 }
 
 // parse_argument_list reads a non-empty comma-separated argument list into `arguments`,
-// which holds MAX_CALL_ARGUMENTS entries. Returns how many were read, or -1 after
-// reporting a failure.
+// which holds MAX_CALL_ARGUMENTS entries. Returns how many were read, or -1 on failure.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes arguments (arg_t) which holds the call's argument expressions.
@@ -114,7 +113,7 @@ static int parse_argument_list(parser_t *parser, arg_t *arguments) {
 
 // parse_call_arguments reads a call's arguments and its closing parenthesis, the opening
 // one having been consumed.
-// Returns how many arguments were read, or -1 after reporting a failure.
+// Returns how many arguments were read, or -1 on failure.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes arguments (arg_t) which holds the call's argument expressions.
@@ -218,15 +217,21 @@ static int parse_step_parameter(parser_t *parser, const char **name, int *length
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes step (lambda_t) which receives the body.
-// Returns 1, or 0 after reporting a failure.
+// Returns 1 on success or 0 on failure.
 static int parse_step_body(parser_t *parser, lambda_t *step) {
     if (parser->token.kind != TK_LBRACE) {
         step->result = parse_expr(parser);
         return step->result != NULL;
     }
     parse_advance(parser);
+    parameter_t parameters[2];
+    memset(parameters, 0, sizeof parameters);
+    parameters[0].name = step->carry_name;
+    parameters[0].name_length = step->carry_name_length;
+    parameters[1].name = step->tick_name;
+    parameters[1].name_length = step->tick_name_length;
     bind_t bindings[MAX_BINDINGS];
-    const int count = parse_bindings(parser, bindings);
+    const int count = parse_bindings(parser, bindings, parameters, 2);
     if (count < 0) {
         return 0;
     }
@@ -244,12 +249,9 @@ static int parse_step_body(parser_t *parser, lambda_t *step) {
 
 // parse_lambda parses a step function, `(acc, t) => e` or `(acc, t) => { ... return e }`.
 //
-// The arity is fixed at two and the refusals say so: one parameter has no tick index to
-// advance by and three has no protocol, so neither is accepted with a silent
-// reinterpretation. A step that does not need its tick index still writes one and ignores
-// it, which costs nothing, because the index is lowered on first reference and a body
-// that never names it mints no node. The two names must also differ, because both are
-// bound in one scope and the later one would capture every read.
+// A step takes exactly two parameters, the carry and the tick index. Both names are
+// required and must differ because they share a scope. The resolver builds a tick node
+// only if the body reads the index.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static expr_t *parse_lambda(parser_t *parser) {
@@ -306,8 +308,8 @@ static expr_t *parse_lambda(parser_t *parser) {
     return parse_step_body(parser, step) ? node : NULL;
 }
 
-// parse_primary parses one primary expression: a literal, a parenthesised expression, or
-// an identifier that may open a call.
+// parse_primary parses a literal, a parenthesised expression or an identifier that may
+// open a call.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static expr_t *parse_primary(parser_t *parser) {
@@ -345,8 +347,7 @@ static expr_t *parse_primary(parser_t *parser) {
     return NULL;
 }
 
-// refuse_unknown_at_word reports an `@` that does not open a waiver, and always returns
-// 0.
+// refuse_unknown_at_word reports the invalid token after an `@` and always returns 0.
 //
 // The two cases get different messages because they are different mistakes. A lane word
 // after the `@` gets a refusal naming the two spellings that work, because somebody who
@@ -356,12 +357,8 @@ static expr_t *parse_primary(parser_t *parser) {
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Returns 0, always, so parse_bless can report and return in one expression.
 static long long refuse_unknown_at_word(parser_t *parser) {
-    const parser_t at = *parser;
-    parse_advance(parser);
-    const int retired = parser->token.kind == TK_QUALIFIER;
     const span_t where = parser->token.span;
-    *parser = at;
-    if (retired) {
+    if (parser->token.kind == TK_QUALIFIER) {
         diagnostic_error(parser->diagnostics, where,
                    "a lane is a fact about a value, so it is written where the value is named: "
                    "`replay <name> := <expression>`, or `func f() replay T` for a return");
@@ -373,29 +370,22 @@ static long long refuse_unknown_at_word(parser_t *parser) {
     return 0;
 }
 
-// parse_bless reads a `@bless` or `@bless(N)` at the cursor, returning what the binding
-// should store: 0 when there is none, BLESS_PROMISE for the bare form, and `checksum + 1`
-// for the conditional one.
+// parse_bless reads an optional `@bless` or `@bless(N)` on a binding.
 //
-// It is not an arm of parse_qualifiers, which reads lane demands: kept apart, an `@bless`
-// where a lane belongs reaches the unknown-annotation path, a lane where a waiver belongs
-// is not a waiver, and neither reader needs a rule about the other. The checksum is
-// range-checked before it is converted, for two reasons: a fractional one truncates, so
-// `@bless(3.5)` would vouch for checksum 3, and one past what a `long long` holds is
-// undefined behaviour on the conversion itself (C11 6.3.1.4). The bound is UINT_MAX
-// because eval_bless_checksum returns `unsigned`, so anything above it could never match.
-// The argument is a bare number: parse_argument_label discards labels, so a labelled form
-// here would accept `@bless(banana: a + b)`.
+// The checksum must be a bare numeric literal in the range of the unsigned value returned
+// by eval_bless_checksum. The parser rejects a labelled expression such as
+// `@bless(banana: a + b)`. Checking the number before conversion prevents truncation of a
+// fractional checksum such as `@bless(3.5)` and avoids converting an out-of-range value
+// to `long long` (C11 6.3.1.4).
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Returns 0 for absent, BLESS_PROMISE for the bare form, or a checksum biased by one.
+// Returns 0 for an absent waiver, BLESS_PROMISE for the bare form, or a checksum biased
+// by one. The caller checks the parser's failure flag before using the result.
 long long parse_bless(parser_t *parser) {
-    if (parser->token.kind != TK_AT) {
+    if (!parse_accept(parser, TK_AT)) {
         return 0;
     }
-    const parser_t saved = *parser;
-    if (!parse_accept(parser, TK_AT) || !parse_accept_keyword(parser, "bless")) {
-        *parser = saved;
+    if (!parse_accept_keyword(parser, "bless")) {
         return refuse_unknown_at_word(parser);
     }
     if (!parse_accept(parser, TK_LPAREN)) {
@@ -425,9 +415,8 @@ long long parse_bless(parser_t *parser) {
 // refuse_bless_on_factor reports a waiver written inside an expression rather than on the
 // binding that names the value, and always returns 0.
 //
-// A waiver belongs to a binding because a binding holds one value, so one waiver covers
-// one leaf by construction and cannot be made to cover two. Whether the value is such a
-// leaf is a question about the graph, and it is asked where the program is resolved.
+// A waiver covers one binding. The resolver checks whether its value is an external
+// source or an opaque call, and which form of waiver it accepts.
 //
 // Takes parser (parser_t) which is the parser's diagnostic sink.
 // Takes node (expr_t) which is the factor the waiver was written on.
@@ -440,16 +429,11 @@ static int refuse_bless_on_factor(parser_t *parser, const expr_t *node) {
     return 0;
 }
 
-// parse_factor parses a factor, which is a primary with a waiver possibly written before
-// it.
-//
-// A lane cannot be written here. A lane is a fact about a value, so it is written where a
-// value is named; an expression names nothing, so there is no lane to read at this
-// position. A waiver is read here and refused for its own reason: it belongs to the
-// binding that names the value, where one promise covers one leaf by construction.
+// parse_factor parses a primary expression and diagnoses a misplaced waiver. A waiver
+// belongs on the binding that names the value it covers.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Returns the factor, or NULL after reporting a defect.
+// Returns the factor, or NULL on failure.
 static expr_t *parse_factor(parser_t *parser) {
     const long long bless = parse_bless(parser);
     if (parser->failed) {
@@ -506,7 +490,7 @@ static int parse_depth_exceeded(parser_t *parser) {
     return 1;
 }
 
-// parse_term parses a term: factors joined left to right by `*` and `/`.
+// parse_term joins factors from left to right with `*` and `/`.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static expr_t *parse_term(parser_t *parser) {
@@ -524,8 +508,8 @@ static expr_t *parse_term(parser_t *parser) {
     return left;
 }
 
-// parse_expr_inner parses an expression: terms joined left to right by `+` and `-`. The
-// depth guard is in parse_expr, which wraps this.
+// parse_expr_inner joins terms from left to right with `+` and `-`. The caller,
+// parse_expr, enforces the depth limit.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static expr_t *parse_expr_inner(parser_t *parser) {

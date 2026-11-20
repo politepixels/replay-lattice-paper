@@ -12,32 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef RL_STATUS_H
-#define RL_STATUS_H
+#ifndef LANELANG_STATUS_H
+#define LANELANG_STATUS_H
 
 #include <stdio.h>
 #include <string.h>
 
-// RL_EXIT_PASS is the exit code of a gate that passed. Read by reproduce.sh as "this leg
-// asserted and held".
+// RL_EXIT_PASS is the exit code for a check that passed.
 #define RL_EXIT_PASS 0
 
-// RL_EXIT_FAIL is the exit code of a gate that failed. Any other non-zero code is
-// reported as an exit the harness has no reading for.
+// RL_EXIT_FAIL is the exit code for a check that failed.
 #define RL_EXIT_FAIL 1
 
-// RL_EXIT_SKIP is the exit code of a gate that could not run here. 77 is the autotools
-// convention for a skipped test, so CI output reads the same way it does for any other
-// project.
+// RL_EXIT_SKIP is the exit code for a check that could not run.
 #define RL_EXIT_SKIP 77
 
-// rl_status prints the one status line a gate owes and returns the exit code for main().
+// rl_status prints a status receipt and returns the corresponding exit code.
 //
-// Takes leg (char) which names the leg the receipt belongs to.
-// Takes result (char) which is PASS, SKIP or FAIL.
-// Takes cases (long) which is how many assertions the gate made.
-// Takes skipped (long) which is how many it declined.
-// Takes reason (char) which is the declared reason token.
+// Takes leg (char) which identifies the check.
+// Takes result (char) which is PASS, FAIL or SKIP.
+// Takes cases (long) which counts the cases reported by this check.
+// Takes skipped (long) which counts the cases skipped.
+// Takes reason (char) which names the reason recorded in the receipt.
 static inline int rl_status(
     const char *leg,
     const char *result,
@@ -54,16 +50,14 @@ static inline int rl_status(
     return result[0] == 'S' ? RL_EXIT_SKIP : RL_EXIT_FAIL;
 }
 
-// RL_PASS reports leg `leg` as having made `cases` assertions, all of which held.
+// RL_PASS reports how many cases a passing check counted.
 #define RL_PASS(leg, cases)          rl_status((leg), "PASS", (cases), 0, "-")
 
-// RL_FAIL reports leg `leg` as broken after `cases` assertions, naming a declared FAIL
-// token.
+// RL_FAIL reports how many cases a failing check counted and why it failed.
 #define RL_FAIL(leg, cases, reason)  rl_status((leg), "FAIL", (cases), 0, (reason))
 
-// RL_CTL_MARK appends one control macro name to a comma-separated list. The buffer must
-// be a character array, not a pointer, because its capacity is taken with sizeof, and it
-// must already be NUL terminated.
+// RL_CTL_MARK appends a control macro name to a comma-separated list. The caller supplies
+// a NUL-terminated character array so that sizeof gives its capacity.
 #define RL_CTL_MARK(buffer, name)                                                     \
     do {                                                                              \
         if ((buffer)[0]) {                                                            \
@@ -72,9 +66,8 @@ static inline int rl_status(
         strncat((buffer), (name), sizeof (buffer) - strlen(buffer) - 1);              \
     } while (0)
 
-// rl_control_macros returns the control macros this binary was built with, comma
-// separated, or "-" for a clean build. The storage is static, so the result is valid
-// until the next call.
+// rl_control_macros lists the control macros enabled for this build, or "-" for a clean
+// build. The returned string is valid until the next call.
 static inline const char *rl_control_macros(void) {
     static char buffer[512];
     buffer[0] = '\0';
@@ -126,27 +119,22 @@ static inline const char *rl_control_macros(void) {
     return buffer[0] ? buffer : "-";
 }
 
-// rl_build_stamp prints the build fingerprint every check binary owes before its
-// assertions.
+// rl_build_stamp prints the compiler, build settings and active controls for a check.
 //
-// Takes who (char) which names the binary printing the line.
+// Takes who (char) which names the binary running the check.
 static inline void rl_build_stamp(const char *who) {
-    printf("BUILD %s compiler=%s std=%ld double=%zu opt=%s ctl=%s\n",
-           who,
 #if defined(__VERSION__)
-           __VERSION__,
+    const char *compiler = __VERSION__;
 #else
-           "unknown",
+    const char *compiler = "unknown";
 #endif
-           (long) __STDC_VERSION__,
-           sizeof(double),
 #if defined(__OPTIMIZE__)
-           "yes",
+    const char *optimised = "yes";
 #else
-           "no",
+    const char *optimised = "no";
 #endif
-           rl_control_macros()
-    );
+    printf("BUILD %s compiler=%s std=%ld double=%zu opt=%s ctl=%s\n",
+           who, compiler, (long) __STDC_VERSION__, sizeof(double), optimised, rl_control_macros());
 }
 
-#endif  // RL_STATUS_H
+#endif  // LANELANG_STATUS_H

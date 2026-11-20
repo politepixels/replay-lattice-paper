@@ -17,6 +17,8 @@
 #include "lexer.h"
 #include "parse_internal.h"
 
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -56,8 +58,7 @@ static void arena_free(arena_t *arena) {
     arena->head = NULL;
 }
 
-// ast_free releases a program and every node its arena holds; a NULL program is allowed
-// and does nothing.
+// ast_free releases a program and every node its arena holds. It accepts NULL.
 //
 // Takes program (program_t) which is the parsed program.
 void ast_free(program_t *program) {
@@ -72,8 +73,8 @@ void ast_free(program_t *program) {
 }
 
 // parse_copy_to_arena copies `count` items of `item_size` bytes each into the arena.
-// Returns the copy, or NULL both when `count` is zero and when the allocation failed; the
-// two are told apart by `parser->failed`, which is set only in the second case.
+// Returns NULL for an empty array or a failed allocation. Only a failed allocation sets
+// `parser->failed`.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes items (void) which is the array being copied.
@@ -157,9 +158,6 @@ int parse_expect_keyword(parser_t *parser, const char *keyword) {
     return 0;
 }
 
-// QUALIFIER_WORDS is the four reserved words, for the near-miss check below.
-static const char *const QUALIFIER_WORDS[] = { "replay", "exact", "approx", "ungrounded" };
-
 // word_is_near_miss reports whether `name` is one edit away from `word`, counting a
 // substitution, an insertion or a deletion.
 //
@@ -196,25 +194,23 @@ static int word_is_near_miss(const char *name, const int length, const char *wor
 
 // qualifier_near_miss returns the reserved word `name` was probably meant to be, or NULL.
 //
-// Reserving the four words does not catch a misspelled one: `replayy v := sum(x)` binds a
-// name the lexer has no reason to doubt, and the failure surfaces one token later as a
-// missing `:=`, which describes the punctuation rather than the word. Naming the word
-// costs one comparison at a position that has already failed.
+// In `replayy v := sum(x)` the lexer reads the misspelt qualifier as a name. When the
+// parser reaches `v` expecting `:=`, it can point back to the likely spelling mistake.
 //
 // Takes name (char) which is the name as written, not NUL-terminated.
 // Takes length (int) which is how many bytes the name occupies.
 // Returns the intended word, or NULL when the name resembles none of them.
 static const char *qualifier_near_miss(const char *name, const int length) {
-    for (size_t i = 0; i < sizeof QUALIFIER_WORDS / sizeof QUALIFIER_WORDS[0]; i++) {
-        if (word_is_near_miss(name, length, QUALIFIER_WORDS[i])) {
-            return QUALIFIER_WORDS[i];
+    for (const qualifier_word_t *word = LEXER_QUALIFIERS; word->spelling; word++) {
+        if (word_is_near_miss(name, length, word->spelling)) {
+            return word->spelling;
         }
     }
     return NULL;
 }
 
-// parse_report_expected reports that a name was expected, naming the replacement when a
-// qualifier was just consumed and nothing was left for it to qualify.
+// parse_report_expected reports the caller's expected syntax. When a lane qualifier lacks
+// a name, it points to the qualifier and shows where the name belongs.
 //
 // A programmer writing `replay := sum(x)` meant a demand and omitted the name, so the
 // message says so rather than describing the parser's state. The blame goes on the
@@ -238,37 +234,18 @@ static void parse_report_expected(parser_t *parser, const qualifiers_t *qualifie
     diagnostic_error(parser->diagnostics, parser->token.span, "%s", expected);
 }
 
-// parse_qualifier_word reports which qualifier the token at the cursor names, or 0 for
-// none.
-//
-// Takes parser (parser_t) which is the parser's cursor. Outputs: LANE_EXACT, LANE_REPLAY
-// or LANE_APPROX for a lane, -1 for `ungrounded`, 0 otherwise.
-static int parse_qualifier_word(const parser_t *parser) {
-    if (lexer_token_is(&parser->token, "exact"))  {
-        return LANE_EXACT;
-    }
-    if (lexer_token_is(&parser->token, "replay")) {
-        return LANE_REPLAY;
-    }
-    if (lexer_token_is(&parser->token, "approx")) {
-        return LANE_APPROX;
-    }
-    return lexer_token_is(&parser->token, "ungrounded") ? -1 : 0;
-}
-
 // record_qualifier stores one qualifier word in `out`, refusing a second of its kind and
 // a lane written before `ungrounded`. Refusing the second arrangement leaves one spelling
 // of one meaning, so the order is fixed and the parser enforces it.
 //
 // Takes parser (parser_t) which is the parser's diagnostic sink.
 // Takes out (qualifiers_t) which receives the word.
-// Takes word (int) which is parse_qualifier_word's verdict: a lane, or -1 for
-// `ungrounded`.
+// Takes lane (lane_t) which is the stated lane, or LANE_NONE for `ungrounded`.
 // Takes span (span_t) which is the word's source text, for blame.
 // Returns 1, or 0 after reporting a qualifier written out of order or twice.
-static int record_qualifier(parser_t *parser, qualifiers_t *out, const int word,
+static int record_qualifier(parser_t *parser, qualifiers_t *out, const lane_t lane,
                             const span_t span) {
-    if (word == -1) {
+    if (lane == LANE_NONE) {
         if (out->ungrounded || out->lane != LANE_NONE) {
             diagnostic_error(parser->diagnostics, span,
                        "'ungrounded' is written once and before the lane");
@@ -283,29 +260,15 @@ static int record_qualifier(parser_t *parser, qualifiers_t *out, const int word,
             parser->failed = 1;
             return 0;
         }
-        out->lane = (lane_t) word;
+        out->lane = lane;
         out->lane_span = span;
     }
     return 1;
 }
 
-// parse_qualifiers reads the qualifier prefix at the cursor into `out`, consuming nothing
-// when there is none.
-//
-// The lexer gives the four qualifier words their own kind, so the prefix needs no
-// lookahead and no save-and-restore: a word that cannot be a name cannot be mistaken for
-// one. The `return` veto is separate: that word opens a statement, so a qualifier
-// immediately before one is a demand with nothing to attach to, and `replay return
-// sum(x)` would otherwise read as a qualified binding of a variable called `return`,
-// shadowing the keyword. Left here, the qualifier is not consumed and the caller meets
-// the statement it expected.
-//
-// Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Takes out (qualifiers_t) which receives the prefix read.
-// Returns 1, or 0 after reporting a qualifier written out of order or twice.
 #ifdef LANELANG_QUALIFIERS_UNRESERVED
-// parse_qualifiers reads the qualifier prefix at the cursor into `out`, deciding by one
-// token of lookahead: a word with no name after it is left as a name.
+// parse_qualifiers reads the prefix in the unreserved control build. A qualifier spelling
+// counts as a prefix only when the following token can name what it qualifies.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes out (qualifiers_t) which receives the prefix read.
@@ -314,13 +277,10 @@ static int parse_qualifiers(parser_t *parser, qualifiers_t *out) {
     memset(out, 0, sizeof *out);
     out->lane = LANE_NONE;
     for (;;) {
-        if (parser->token.kind != TK_IDENT) {
+        if (parser->token.kind != TK_IDENT || !parser->token.qualifier) {
             return 1;
         }
-        const int word = parse_qualifier_word(parser);
-        if (word == 0) {
-            return 1;
-        }
+        const lane_t lane = parser->token.qualifier->lane;
         const span_t span = parser->token.span;
         const parser_t saved = *parser;
         const int mark = diagnostic_mark(parser->diagnostics);
@@ -331,14 +291,15 @@ static int parse_qualifiers(parser_t *parser, qualifiers_t *out) {
             diagnostic_rewind(parser->diagnostics, mark);
             return 1;
         }
-        if (!record_qualifier(parser, out, word, span)) {
+        if (!record_qualifier(parser, out, lane, span)) {
             return 0;
         }
     }
 }
 #else
 // parse_qualifiers reads the qualifier prefix at the cursor into `out`, consuming nothing
-// when there is none. See the block above the guard for what the prefix means.
+// when there is none. The lexer identifies the reserved words. The parser looks ahead for
+// `return` because it opens a statement and cannot name the value being qualified.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes out (qualifiers_t) which receives the prefix read.
@@ -347,7 +308,7 @@ static int parse_qualifiers(parser_t *parser, qualifiers_t *out) {
     memset(out, 0, sizeof *out);
     out->lane = LANE_NONE;
     while (parser->token.kind == TK_QUALIFIER) {
-        const int word = parse_qualifier_word(parser);
+        const lane_t lane = parser->token.qualifier->lane;
         const span_t span = parser->token.span;
         const parser_t saved = *parser;
         parse_advance(parser);
@@ -355,7 +316,7 @@ static int parse_qualifiers(parser_t *parser, qualifiers_t *out) {
             *parser = saved;
             return 1;
         }
-        if (!record_qualifier(parser, out, word, span)) {
+        if (!record_qualifier(parser, out, lane, span)) {
             return 0;
         }
     }
@@ -366,9 +327,8 @@ static int parse_qualifiers(parser_t *parser, qualifiers_t *out) {
 // parse_type accepts a type and discards it. Returns 1 on success, or 0 after reporting a
 // failure.
 //
-// It keeps nothing, because no judgement in this compiler consults a declared type: the
-// checker's subject is the lane. The function exists so that `func main() Banana` is
-// refused at the point it is written.
+// The checker uses the lane judgement. Parsing the type here lets it reject `func main()
+// Banana` at the type name.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static int parse_type(parser_t *parser) {
@@ -385,8 +345,8 @@ static int parse_type(parser_t *parser) {
     return 0;
 }
 
-// parse_parameter_type reads a parameter's type, adding a note when a qualifier is what
-// went wrong.
+// parse_parameter_type reads a parameter's type. If the type fails to parse after a lane
+// qualifier, it adds a note showing the expected parameter syntax.
 //
 // A qualified parameter is `<lane> <name> <type>`, so writing the lane and the type but
 // no name puts the type where the name belongs. The parser takes it as the name, then
@@ -511,13 +471,13 @@ static int parse_parameters(parser_t *parser, parameter_t *parameters) {
 // parse_one_binding reads one `@bless(N)? lane? name := expr` binding into `binding`.
 //
 // The waiver is read first and the qualifier second, so `@bless(N) replay x := ...` is
-// legal and the reverse order is not. `ungrounded` is refused here, because it describes
-// what a function returns, a claim about a body the checker cannot see, while a binding's
-// right-hand side is a body the checker is looking at.
+// legal. The grounding qualifier belongs on a function's return type. It lets the
+// declaration reserve the right to depend on external inputs even when its body is
+// grounded.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes binding (bind_t) which receives the binding read.
-// Returns 1, or 0 after reporting a failure.
+// Returns 1 on success or 0 on failure.
 static int parse_one_binding(parser_t *parser, bind_t *binding) {
     const span_t bless_span = parser->token.span;
     binding->bless = parse_bless(parser);
@@ -565,13 +525,38 @@ static int parse_one_binding(parser_t *parser, bind_t *binding) {
     return binding->value != NULL;
 }
 
+// binding_name_is_taken reports whether `name` is already bound among the first `count`
+// entries of `bindings`.
+//
+// Takes bindings (bind_t) which holds the bindings read so far.
+// Takes count (int) which is how many of them are in use.
+// Takes name (char) which is the candidate name, not NUL terminated.
+// Takes name_length (int) which is how many bytes of `name` belong to it.
+static int binding_name_is_taken(
+    const bind_t *bindings,
+    const int count,
+    const char *name,
+    const int name_length
+) {
+    for (int i = 0; i < count; i++) {
+        if (bindings[i].name_length == name_length
+            && memcmp(bindings[i].name, name, (size_t) name_length) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // parse_bindings reads the `name := expr` bindings at the head of a body into `bindings`,
 // which holds MAX_BINDINGS entries, stopping at `return`.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Takes bindings (bind_t) which holds the bindings in scope.
-// Returns how many were read, or -1 after reporting a failure.
-int parse_bindings(parser_t *parser, bind_t *bindings) {
+// Takes bindings (bind_t) which receives the bindings in source order.
+// Takes parameters (parameter_t) which holds the body's parameters.
+// Takes parameter_count (int) which is how many parameters the body has.
+// Returns how many were read, or -1 on failure.
+int parse_bindings(parser_t *parser, bind_t *bindings, const parameter_t *parameters,
+                   const int parameter_count) {
     int count = 0;
     while ((parser->token.kind == TK_IDENT || parser->token.kind == TK_AT
             || parser->token.kind == TK_QUALIFIER)
@@ -583,6 +568,24 @@ int parse_bindings(parser_t *parser, bind_t *bindings) {
             return -1;
         }
         if (!parse_one_binding(parser, &bindings[count])) {
+            return -1;
+        }
+        const bind_t *binding = &bindings[count];
+        if (parameter_name_is_taken(parameters, parameter_count, binding->name,
+                                    binding->name_length)) {
+            diagnostic_error(parser->diagnostics, binding->span,
+                       "'%.*s' is already a parameter of this body, and binding it again would "
+                       "hide the argument, so a demand written on the parameter would hold of a "
+                       "value the body never reads", binding->name_length, binding->name);
+            parser->failed = 1;
+            return -1;
+        }
+        if (binding_name_is_taken(bindings, count, binding->name, binding->name_length)) {
+            diagnostic_error(parser->diagnostics, binding->span,
+                       "'%.*s' is bound twice in this body, and the body can read only the later "
+                       "one, so a demand written on the earlier would hold of a value the body "
+                       "never reads", binding->name_length, binding->name);
+            parser->failed = 1;
             return -1;
         }
         count++;
@@ -624,18 +627,19 @@ static int parse_func_signature(parser_t *parser, func_t *function) {
     return 1;
 }
 
-// parse_func_body reads a declaration's braced body into `function`: its bindings and its
-// result expression.
-// Returns 1 on success, or 0 after reporting a failure.
+// parse_func_body reads the bindings and result expression of a braced body into
+// `function`.
+// Returns 1 on success or 0 on failure.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Takes function (func_t) which is the function being lowered.
+// Takes function (func_t) which receives the parsed body.
 static int parse_func_body(parser_t *parser, func_t *function) {
     if (!parse_expect(parser, TK_LBRACE)) {
         return 0;
     }
     bind_t bindings[MAX_BINDINGS];
-    const int count = parse_bindings(parser, bindings);
+    const int count = parse_bindings(parser, bindings, function->parameters,
+                                     function->parameter_count);
     if (count < 0) {
         return 0;
     }
@@ -652,13 +656,13 @@ static int parse_func_body(parser_t *parser, func_t *function) {
     return !function->result ? 0 : parse_expect(parser, TK_RBRACE);
 }
 
-// parse_func parses one function declaration into `function`. The lane goes in the return
-// type: it is a promise about the value handed back, checked against the body, and it
-// sets no ambient inside it.
+// parse_func parses one function declaration into `function`. The lane in the return type
+// states a promise about the result. The checker tests that promise against the body,
+// whose ambient lane is independent of the return type.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes function (func_t) which receives the declaration.
-// Returns 1 on success, or 0 after reporting a failure.
+// Returns 1 on success or 0 on failure.
 static int parse_func(parser_t *parser, func_t *function) {
     memset(function, 0, sizeof *function);
     function->lane = LANE_NONE;
@@ -691,9 +695,8 @@ static int parse_func(parser_t *parser, func_t *function) {
 // parse_package_clause reads the `package NAME` clause and keeps nothing from it. Returns
 // 1 on success, or 0 after reporting a failure.
 //
-// The name is validated and discarded, because this compiler has no second package to
-// tell it apart from: there is no import form, no qualified name and one translation
-// unit. Validating the name refuses `package 3`, and the clause has no other effect.
+// The compiler has one translation unit and no imports or qualified names. It checks the
+// package name to catch mistakes such as `package 3` and then discards it.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static int parse_package_clause(parser_t *parser) {
@@ -710,7 +713,7 @@ static int parse_package_clause(parser_t *parser) {
 
 // BUILTIN_NAMES is every name `lower_call` answers before it looks a declaration up. A
 // declaration under one of these names would be compiled and never called, so it is
-// refused; a builtin added to `lower_call` belongs here too.
+// refused. A builtin added to `lower_call` belongs here too.
 static const char *const BUILTIN_NAMES[] = {
     "indices", "integers", "source", "scan", "choose", "iterate", "sum", "isum"
 };
@@ -752,7 +755,7 @@ static int function_name_is_taken(
 }
 
 // parse_functions reads declarations into `functions`, which holds MAX_FUNCTIONS entries,
-// until the source ends or the parse fails. Returns how many were read; the caller
+// until the source ends or the parse fails. Returns how many were read. The caller
 // discards them all if anything failed.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
@@ -790,8 +793,7 @@ static int parse_functions(parser_t *parser, func_t *functions) {
     return count;
 }
 
-// parse_abandon releases the parser's arena and returns NULL; parse_program fails through it
-// once the arena exists.
+// parse_abandon releases the parser's arena and returns NULL to report failure.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 static program_t *parse_abandon(parser_t *parser) {
@@ -824,8 +826,50 @@ static program_t *parse_finish(
     return program;
 }
 
-// parse_program parses one source file into a program, or returns NULL after reporting at
-// least one error. The returned program borrows `source`, which must outlive it.
+// parse_read_source reads a complete source file into a NUL-terminated buffer. Embedded
+// NUL bytes would terminate the lexer's input early and are rejected here.
+//
+// Takes path (char) which names the source file.
+// Takes nul_byte (size_t) which receives the one-based offset of an embedded NUL, or
+// zero.
+// Returns a buffer owned by the caller, or NULL if the file could not be read as source.
+char *parse_read_source(const char *path, size_t *nul_byte) {
+    *nul_byte = 0;
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return NULL;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        (void) fclose(file); return NULL;
+    }
+    const long size = ftell(file);
+    if (size < 0 || (unsigned long) size >= SIZE_MAX || fseek(file, 0, SEEK_SET) != 0) {
+        (void) fclose(file); return NULL;
+    }
+    char *buffer = (char *) malloc((size_t) size + 1);
+    if (!buffer) {
+        (void) fclose(file); return NULL;
+    }
+    const size_t read_count = fread(buffer, 1, (size_t) size, file);
+    if (read_count != (size_t) size || fgetc(file) != EOF || ferror(file)) {
+        free(buffer);
+        (void) fclose(file);
+        return NULL;
+    }
+    (void) fclose(file);
+    const char *nul = memchr(buffer, '\0', read_count);
+    if (nul) {
+        *nul_byte = (size_t) (nul - buffer) + 1;
+        free(buffer);
+        return NULL;
+    }
+    buffer[read_count] = '\0';
+    return buffer;
+}
+
+// parse_program parses one source file into a program and returns NULL on failure. Syntax
+// errors are reported through the diagnostic sink. The returned program borrows the
+// source text and file name, which must outlive it.
 //
 // Takes file (char) which is the file being read.
 // Takes source (char) which is the source text, borrowed.

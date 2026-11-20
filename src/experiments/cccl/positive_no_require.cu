@@ -14,14 +14,10 @@
 #include <cub/device/device_reduce.cuh>
 #include <cuda/__execution/require.h>
 
-// The execution namespace holding `require`.
 namespace ex  = cuda::execution;
 
-// The namespace holding the determinism guarantees themselves.
 namespace det = ex::determinism;
 
-// no_require reduces `in` into `out` with a determinism property placed straight into the
-// environment, where it has no effect and is refused.
 void no_require(float *in, float *out) {
     (void) cub::DeviceReduce::Reduce(in, out, 100, cuda::std::plus<float>{}, 0.0f,
                                      cuda::std::execution::env{det::run_to_run});

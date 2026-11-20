@@ -37,7 +37,8 @@ static int step_shadows_name(const lambda_t *step, const char *name, const int n
         || names_equal(step->tick_name, step->tick_name_length, name, name_length);
 }
 
-// expr_reads_name answers whether an expression names `name` anywhere inside it.
+// expr_reads_name reports whether an expression reads the binding named `name`. A nested
+// step can shadow the binding.
 //
 // Takes expression (expr_t) which is the expression being searched, and may be NULL.
 // Takes name (char) which is the name being looked for.
@@ -73,9 +74,8 @@ static int expr_reads_name(const expr_t *expression, const char *name, const int
 // step_reads_name answers whether a step function reads `name`, stopping at a binding
 // that shadows it.
 //
-// A binding of the same name ends the search, because every reference after it is to the
-// binding; the binding's own value is still searched, since it is evaluated before the
-// name is rebound.
+// References after a binding of the same name belong to that binding. The search includes
+// the binding's own value because it is evaluated before the name is rebound.
 //
 // Takes step (lambda_t) which is the step function being searched.
 // Takes name (char) which is the name being looked for.
@@ -109,19 +109,16 @@ static const arg_t *iterate_argument(const expr_t *call, const char *label) {
     return NULL;
 }
 
-// ITERATE_ARGUMENT_COUNT is how many arguments an `iterate` call takes: `times:`, `from:`
-// and `with:`, all three required and none positional.
+// ITERATE_ARGUMENT_COUNT counts the three required named arguments `times:`, `from:` and
+// `with:`.
 #define ITERATE_ARGUMENT_COUNT 3
 
-// MAX_ITERATE_TICKS is the largest tick count an `iterate` clock may state, INT_MAX as a
-// double. The evaluator counts ticks in an int, and converting a double above INT_MAX to
-// int is undefined (C11 6.3.1.4), so a larger literal is refused at check time and the
-// conversion never sees one.
+// MAX_ITERATE_TICKS caps an `iterate` clock at the largest signed 32-bit integer. The
+// resolver checks the bound before the evaluator converts the count to int.
 #define MAX_ITERATE_TICKS 2147483647.0
 
-// iterate_missing_label names the first required label a call does not carry, for the
-// refusal that reports it. Called only when one of the three is absent, so `with:` is the
-// answer once the other two are present.
+// iterate_missing_label names the first required label the call omits. Its caller has
+// already established that at least one label is missing.
 //
 // Takes times (arg_t) which is the tick count argument, or NULL.
 // Takes from (arg_t) which is the seed argument, or NULL.
@@ -142,13 +139,9 @@ static const char *iterate_missing_label(const arg_t *times, const arg_t *from,
 // iterate_is_well_formed checks an `iterate` call's shape, writing its three arguments
 // through the out parameters.
 //
-// `with:` is not checked for a step function here, because the grammar cannot deliver
-// anything else: parse_argument_value reads a `with:` label and calls parse_lambda, so a
-// `with:` whose value is not a step function is a syntax error before this pass runs.
-// Every argument is named, all three are required, and there is no positional form and no
-// default, because a recurrence with no seed and one seeded at zero are different
-// programs. The tick count must be a literal the checker can read, so the number of
-// rewinds is fixed before the run starts.
+// parse_argument_value requires a step function after `with:`. All three labels are
+// mandatory so a missing seed cannot be mistaken for a zero seed. A literal tick count
+// fixes the number of iterations before evaluation starts.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -197,7 +190,7 @@ static int iterate_is_well_formed(resolve_state_t *state, const expr_t *call,
 // caller binds the name.
 //
 // The carried edge is left unset here and filled in by the caller once the step's result
-// has been lowered, because that expression reads the name this node provides.
+// has been lowered, since that expression may read the name this node provides.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -229,9 +222,8 @@ static int lower_carried_name(resolve_state_t *state, const expr_t *call, expr_t
 // lower_tick_index builds the node holding the recurrence's 0-based tick index, returning
 // its index or -1 after reporting a defect.
 //
-// It is a leaf, so it takes no operand and no carried edge; `tick_of` names the
-// recurrence whose counter it reads and is part of the interning key, so a nested
-// recurrence's inner index stays distinct from its outer one.
+// The tick node is a leaf. Its interning key includes `tick_of`, the recurrence whose
+// counter it reads, so nested clocks keep distinct indices.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes owner (int) which is the OP_RECUR node whose ticks are counted.
@@ -258,10 +250,9 @@ static int lower_tick_index(resolve_state_t *state, const int owner, const lambd
 // not read the value it seeds. The carried name becomes its own node holding this tick's
 // value, with the seed as its input and the step's result as its carried edge, so one
 // node per recurrence means the join sweep needs no notion of what a recurrence carries.
-// The step's bindings are lowered after the name is in scope, and its result last, so the
-// result reads the tick's current values. No pass mints a node kind for the surface form:
-// the parser produces an ordinary EX_CALL, and this function builds the carried node
-// straight from it.
+// The step's bindings are lowered after the name enters scope. Its result is lowered
+// last, so it reads the tick's current values. The parser represents the call as an
+// ordinary EX_CALL.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -307,7 +298,9 @@ static int lower_iterate(resolve_state_t *state, expr_t *call) {
     if (next_node < 0) {
         return -1;
     }
-    dag_at(state->dag, carried_node)->carried = next_node;
+    dagnode_t *recurrence = dag_at(state->dag, carried_node);
+    recurrence->carried = next_node;
+    recurrence->step_end = dag_count(state->dag) - 1;
 
     state->scope_count = saved_scope;
     return carried_node;
@@ -332,14 +325,9 @@ func_t *find_function(program_t *program, const char *name, const int name_lengt
 // call_is_well_formed reports whether a call may be inlined, having reported the defect
 // if not.
 //
-// A label on a call is a claim, and it is checked: parse_argument_label reads a `name:`
-// on any argument while the binding stays positional, so an unchecked label naming a
-// different parameter would be a comment the compiler ignored and could contradict, with
-// the labels saying one thing and the graph doing the reverse. A label names the
-// parameter it fills and does not reorder, because reordering would make two spellings of
-// one call; an unlabelled argument stays legal. A step function is skipped here and
-// refused where it lands, because reporting its mismatched `with:` label would pre-empt
-// the better message, that a step is not a value.
+// Arguments bind by position. When an argument has a label, it must name the parameter at
+// that position. Step functions skip this check so the resolver can diagnose a `with:`
+// argument used where a value belongs.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes function (func_t) which is the function being lowered.
@@ -373,9 +361,18 @@ static int call_is_well_formed(
         state->malformed = 1;
         return 0;
     }
+    for (int i = 0; i <= state->depth; i++) {
+        if (state->active[i] == function) {
+            diagnostic_error(state->diagnostics, call->span,
+                       "'%.*s' is called while it is still being lowered (recursion is not "
+                       "supported)", call->name_length, call->name);
+            state->malformed = 1;
+            return 0;
+        }
+    }
     if (state->depth >= MAX_INLINE_DEPTH) {
         diagnostic_error(state->diagnostics, call->span,
-                   "call nesting too deep (recursion is not supported)");
+                   "call nesting too deep");
         state->malformed = 1;
         return 0;
     }
@@ -409,31 +406,30 @@ static int lower_call_arguments(resolve_state_t *state, expr_t *call, int *argum
 // inline_body lowers a called function's body into the caller's graph and returns the
 // node its result evaluates to, or -1 after a defect has been reported.
 //
-// The caller's scope, depth and promise scope are restored before return; the ambient is
-// not saved, because nothing here changes it. A parameter's demand is checked at the call
-// site, on the caller's argument node, so blame names both ends: the demand's span in the
-// callee's signature and the value's span at the call. declare_demand nests a parameter
-// demand over any lane the caller already wrote on the same value, so the caller's stated
-// lane is checked against the parameter rather than replaced by it. No ambient comes from
-// the declaration, because a declared return lane is a promise checked against the body,
-// and an ambient would pin every fold inside to the promised kernel and make the promise
-// true by construction. Instead the body of a lane-publishing function gets a promise
-// scope, which separates its cone from the caller's without selecting a kernel; a body
-// built under no mark would intern with whatever the caller wrote beside it, gaining a
-// consumer no source expression corresponds to, and the escape test would then refuse to
-// pin a producer that never escaped.
+// The caller's scope, depth and promise scope are restored before return. A parameter's
+// demand wraps the caller's argument, preserving any lane already stated on it. Blame
+// points to the demand in the signature, to the origin of the argument's weaker lane and
+// to the argument in the call.
+//
+// A function's return lane is checked against its body. Making it the ambient lane would
+// select the promised kernels before that check. A separate promise scope prevents
+// interning the body's nodes with the caller's and keeps the escape test from counting a
+// use introduced only by that sharing.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes function (func_t) which is the function being lowered.
+// Takes call (expr_t) which is the call site whose arguments a parameter's demand blames.
 // Takes argument_nodes (int) which holds the lowered argument nodes.
 static int inline_body(
     resolve_state_t *state,
     const func_t *function,
+    const expr_t *call,
     const int *argument_nodes
 ) {
     const int saved_scope_count = state->scope_count;
     const int saved_promise = state->promise_scope;
     state->depth++;
+    state->active[state->depth] = function;
     if (function->lane != LANE_NONE) {
         state->next_promise_scope++;
         state->promise_scope = state->next_promise_scope;
@@ -450,6 +446,10 @@ static int inline_body(
                 state->scope_count = saved_scope_count;
                 state->promise_scope = saved_promise;
                 return -1;
+            }
+            dagnode_t *demand = dag_at(state->dag, supplied);
+            if (supplied != argument_nodes[i] && demand->argument_span.line == 0) {
+                demand->argument_span = call->args[i].value->span;
             }
         }
         if (!scope_bind(state, function->parameters[i].name, function->parameters[i].name_length,
@@ -470,16 +470,11 @@ static int inline_body(
 // wrap_opaque puts an OP_OPAQUE node over the lowered body of a call to a function
 // declared `ungrounded`, returning its index or -1 after reporting a defect.
 //
-// The body is lowered like any other and the declaration adds one node. `ungrounded`
-// claims the value the function hands back is not a function of this program, and
-// grounding is seeded at a leaf and conjoined everywhere else, so the claim has nowhere
-// to live on a node built out of grounded parts; this node is the place it goes, and
-// `ground_of_node` answers false for it whatever its input says. The lane is computed
-// from the body by the ordinary join, because writing the ambient lane here would rate a
-// discarded body at the join identity and a waiver would then buy a `replay` the body
-// cannot support. It wraps rather than marks, because `inline_body` does not always
-// return a node this call created, and a mark written on a value the caller owns would
-// let a waiver reach a leaf nobody meant to vouch for.
+// The wrapper records that this call may depend on the outside world, even when its body
+// reads only grounded values. A bare waiver on the call can vouch for it if its body also
+// meets the grounding requirement. The ordinary join still derives the lane from the
+// body. Keeping the waiver on a fresh wrapper prevents it from reaching an argument the
+// callee returns directly.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes call (expr_t) which is the call site being resolved.
@@ -552,7 +547,7 @@ int lower_call(resolve_state_t *state, expr_t *call) {
         return -1;
     }
 
-    int out = inline_body(state, function, argument_nodes);
+    int out = inline_body(state, function, call, argument_nodes);
     if (out >= 0 && function->ungrounded) {
         out = wrap_opaque(state, call, out);
     }

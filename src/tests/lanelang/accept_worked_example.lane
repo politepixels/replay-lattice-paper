@@ -17,8 +17,8 @@ package app
 // EXPECT: accept ungrounded-nodes=5
 // EXPECT-NO-KERNEL: fold_free
 func main() replay Float {
-    @bless raw := source(count: 8.0)  // exact            | ungrounded | waived, blessed
-    s := sum(raw)                     // replay, healed   | ungrounded | waived
-    total := sum(raw * s)             // replay, healed   | ungrounded | waived
-    return total                      // the declared lane, met
+    @bless raw := source(count: 8.0)
+    s := sum(raw)
+    total := sum(raw * s)
+    return total
 }

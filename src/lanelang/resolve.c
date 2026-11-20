@@ -82,9 +82,10 @@ static lane_t demand_carried_by(const dag_t *dag, const int node, int *inner) {
 // Takes value (int) which is the node the demand is about.
 // Takes demand (lane_t) which is the lane the source demanded.
 // Takes at (span_t) which is where the demand was written.
+// Takes stated_by_binding (int) which records a binding qualifier's limit on healing.
 // Returns the demand node's index, or -1 after reporting a defect.
 static int wrap_demand(resolve_state_t *state, const int value, const lane_t demand,
-                       const span_t at) {
+                       const span_t at, const int stated_by_binding) {
     int inner = value;
     const lane_t already = demand_carried_by(state->dag, value, &inner);
 #ifdef LANELANG_DEMAND_STAMPS_NODE
@@ -94,12 +95,13 @@ static int wrap_demand(resolve_state_t *state, const int value, const lane_t dem
         target->declared = want;
         target->declared_span = at;
     }
+    target->stated_by_binding |= stated_by_binding;
     return inner;
 #else
-    if (already == demand) {
+    const dagnode_t *under = dag_at_const(state->dag, value);
+    if (already == demand && (!stated_by_binding || under->stated_by_binding)) {
         return value;
     }
-    const dagnode_t *under = dag_at_const(state->dag, value);
     const char *const named_for = lane_name(demand);
 
     dagnode_t node;
@@ -113,6 +115,7 @@ static int wrap_demand(resolve_state_t *state, const int value, const lane_t dem
     node.label = named_for;
     node.label_length = (int) strlen(named_for);
     node.declared = demand;
+    node.stated_by_binding = stated_by_binding;
     node.declared_span = at;
     return intern_or_report(state, &node, at);
 #endif
@@ -128,7 +131,7 @@ static int wrap_demand(resolve_state_t *state, const int value, const lane_t dem
 // Returns the demand node's index, or -1 after reporting a defect.
 int declare_demand(resolve_state_t *state, const int node, const lane_t demand,
                    const span_t at) {
-    return wrap_demand(state, node, demand, at);
+    return wrap_demand(state, node, demand, at, 0);
 }
 
 // declare_return_promise applies a function's declared return lane to the value it
@@ -137,13 +140,14 @@ int declare_demand(resolve_state_t *state, const int node, const lane_t demand,
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes node (int) which is the node the function returns.
 // Takes function (func_t) which is the function whose signature this is.
-// Returns the node the promise is carried on, or -1 after reporting a weaker body.
+// Returns the node carrying the promise, or -1 if the body states a weaker lane or the
+// demand node could not be allocated.
 int declare_return_promise(resolve_state_t *state, const int node, const func_t *function) {
     const span_t at = function->lane_span.line ? function->lane_span : function->span;
     int inner = node;
     const lane_t stated = demand_carried_by(state->dag, node, &inner);
     if (stated == LANE_NONE) {
-        return wrap_demand(state, node, function->lane, at);
+        return wrap_demand(state, node, function->lane, at, 0);
     }
     if (lane_satisfies(stated, function->lane)) {
         return node;
@@ -156,12 +160,12 @@ int declare_return_promise(resolve_state_t *state, const int node, const func_t 
     return -1;
 }
 
-// declare_call_promise applies a callee's declared return lane at a call site, as a demand
-// on the value the inlined body returns.
+// declare_call_promise applies a function's return lane to its lowered result. It is also
+// used outside a call when the function does not return a locally qualified name.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
-// Takes node (int) which is the node the inlined body returns.
-// Takes function (func_t) which is the function called.
+// Takes node (int) which is the node the body returns.
+// Takes function (func_t) which declares the return lane.
 // Returns the node the promise is carried on, or -1 after reporting a defect.
 int declare_call_promise(resolve_state_t *state, const int node, const func_t *function) {
     int inner = node;
@@ -170,7 +174,7 @@ int declare_call_promise(resolve_state_t *state, const int node, const func_t *f
         return node;
     }
     const span_t at = function->lane_span.line ? function->lane_span : function->span;
-    return wrap_demand(state, node, function->lane, at);
+    return wrap_demand(state, node, function->lane, at, 0);
 }
 
 // bless_is_legal_here reports whether a waiver may be written on the binding that lowered
@@ -217,7 +221,8 @@ static int bless_is_legal_here(resolve_state_t *state, const int node, const bin
 #endif
 }
 
-// bless_target returns the node a waiver on a binding that lowered to `node` is written on.
+// bless_target returns the node a waiver on a binding that lowered to `node` is written
+// on.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes node (int) which is the node the binding lowered to.
@@ -253,12 +258,11 @@ int lower_binding(resolve_state_t *state, const bind_t *binding) {
     }
     int named = node;
     if (binding->lane != LANE_NONE) {
-        named = declare_demand(state, node, binding->lane,
-                               binding->lane_span.line ? binding->lane_span : binding->span);
+        named = wrap_demand(state, node, binding->lane,
+                            binding->lane_span.line ? binding->lane_span : binding->span, 1);
         if (named < 0) {
             return -1;
         }
-        dag_at(state->dag, named)->stated_by_binding = 1;
     }
     return !scope_bind(state, binding->name, binding->name_length, named, binding->span)
            ? -1 : named;
@@ -312,7 +316,7 @@ static int lower_identifier(resolve_state_t *state, const expr_t *expression) {
     return node;
 }
 
-// binop_label returns the one-character label for an operator symbol.
+// binop_label points to the operator in BINOP_SYMBOLS. The caller uses one byte.
 //
 // Takes operator_symbol (int) which is the operator character.
 static const char *binop_label(const int operator_symbol) {
@@ -320,8 +324,8 @@ static const char *binop_label(const int operator_symbol) {
     return found ? found : BINOP_SYMBOLS;
 }
 
-// lower_binop builds the node for a binary operation and returns its index, or -1 when an
-// operand failed to lower.
+// lower_binop builds the node for a binary operation. It returns -1 if either operand
+// fails to lower or the node cannot be allocated.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes expression (expr_t) which is the expression being lowered.
@@ -350,11 +354,9 @@ static int lower_binop(resolve_state_t *state, expr_t *expression) {
 // lower_step_out_of_place reports a step function reaching a position that wants a value,
 // and always returns -1.
 //
-// The grammar admits `(acc, t) => ...` only as the value of a `with:` label, so the only
-// way here is a `with:` written on a call that does not take one, such as `sum(x, with:
-// (a, b) => a)`. The parser cannot refuse that, because it does not know what the callee
-// is; this pass does. A step is not a value, and the message says so rather than
-// reporting a type nobody can write down.
+// The parser accepts a step function as the value of a `with:` argument. Once the callee
+// is known, lowering can diagnose a step in an ordinary argument position. For example,
+// `sum(x, with: (a, b) => a)` parses but fails the argument checks for `sum`.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes expression (expr_t) which is the step function found out of place.
@@ -383,9 +385,8 @@ static int lower_expr_kind(resolve_state_t *state, expr_t *expression) {
 
 // lower_expr lowers one expression, dispatching on its kind.
 //
-// An expression states no demand of its own, so there is no ambient to set here and none
-// to restore; the ambient is introduced in one place, lower_binding, and descends from
-// there.
+// A binding supplies the ambient lane for its right-hand side. Lowering an expression
+// uses that ambient throughout its operands.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes expression (expr_t) which is the expression being lowered.
@@ -444,8 +445,8 @@ static int bind_entry_parameters(resolve_state_t *state, const func_t *function)
     return 1;
 }
 
-// label_node_with_binding_name carries a binding's source name onto the node it lowered
-// to, so that diagnostics and figures can name the value the programmer named.
+// label_node_with_binding_name copies a binding's name onto a fold, elementwise or demand
+// node so diagnostics and figures can display it.
 //
 // Takes dag (dag_t) which is the graph being walked.
 // Takes node_index (int) which is the node's index in the graph.
@@ -458,8 +459,8 @@ static void label_node_with_binding_name(dag_t *dag, const int node_index, const
     }
 }
 
-// lower_entry_bindings lowers every binding of the entry function's body, naming each
-// node after the binding it came from.
+// lower_entry_bindings lowers the bindings of a function being checked on its own and
+// attaches their names where label_node_with_binding_name permits.
 //
 // Takes state (resolve_state_t) which is the lowering in progress.
 // Takes function (func_t) which is the function being lowered.
@@ -475,8 +476,8 @@ static int lower_entry_bindings(resolve_state_t *state, const func_t *function) 
     return 1;
 }
 
-// returns_qualified_binding reports whether `function` returns a name bound in its own body
-// by a binding that writes a lane, the one case declare_return_promise compares.
+// returns_qualified_binding reports whether `function` returns a name bound in its own
+// body by a binding that writes a lane, the one case declare_return_promise compares.
 //
 // Takes function (func_t) which is the function being lowered.
 // Returns 1 when the result names such a binding, 0 otherwise.
@@ -501,6 +502,7 @@ static int returns_qualified_binding(const func_t *function) {
 // Takes function (func_t) which is the function being lowered.
 // Takes out (resolved_t) which receives the result node and the status.
 static void lower_one_function(resolve_state_t *state, func_t *function, resolved_t *out) {
+    state->active[0] = function;
     if (!bind_entry_parameters(state, function) || !lower_entry_bindings(state, function)) {
         out->status = RESOLVE_MALFORMED; return;
     }
@@ -533,14 +535,10 @@ static resolved_t resolve_declaration(program_t *program, func_t *function,
 // standalone pass verifies is the lane the body computes and not a lane it happened to
 // write down.
 //
-// declare_return_promise compares the signature against a qualifier a binding of the body
-// writes, so a body that computes `approx` without saying so declares nothing and the
-// promise holds only because there is nothing to compare; the sweep computes what the body
-// reaches.
-// A sweep that produced no lanes sets `malformed` and a lane violation does not, because a
-// structural failure and a lane verdict are different answers. An allocation failure here
-// reports, sets `malformed` and returns 0, because returning 1 would accept a body the
-// checker had not looked at.
+// Lowering compares any explicit qualifier on the returned binding with the signature.
+// The sweep then checks the computed lane, including for an unqualified body. A
+// structural or allocation failure sets `malformed`. A lane refusal is recorded in
+// `found`.
 //
 // Takes one (resolved_t) which is the lowered declaration.
 // Takes diagnostics (diagnostic_t) which is where a refusal is reported.
@@ -616,10 +614,9 @@ int resolve_verify_declarations(program_t *program, const char *entry,
 // resolve_program lowers `entry` and everything it calls into one DAG, inlining every
 // call.
 //
-// The ambient starts at LANE_NONE, including for the entry's own declared lane, because
-// that lane is a promise about the returned value, applied to the result node and checked
-// there; applied as an outermost ambient it would pin every fold in the body and make the
-// promise true by construction rather than by checking.
+// The entry starts at LANE_NONE. Its declared return lane is checked on the result.
+// Giving that lane to the whole body as an ambient would select the kernels before the
+// checker examined the result.
 //
 // Takes program (program_t) which is the parsed program.
 // Takes entry (char) which names the function to lower.
@@ -663,11 +660,9 @@ resolved_t resolve_program(program_t *program, const char *entry, diagnostic_t *
 // resolve_declaration lowers one function on its own, with its parameters bound as
 // leaves, so that what it promises can be checked whether or not anything calls it.
 //
-// resolve_program lowers the entry function and inlines what it reaches, so without this
-// pass a declared function no call reaches would never be lowered and could promise
-// anything. Parameters become leaves because what a parameter holds is the caller's
-// obligation, and from inside the callee it is grounded by assumption; the lowering asks
-// the question the signature is a claim about, and asks it of the body alone.
+// resolve_program inlines only the declarations reachable from the entry. This pass
+// checks the remaining declarations as well. Each parameter becomes a leaf assumed
+// grounded because the caller must supply its value.
 //
 // Takes program (program_t) which is the parsed program.
 // Takes function (func_t) which is the declaration to lower.

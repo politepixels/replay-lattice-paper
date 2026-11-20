@@ -449,9 +449,15 @@ static int spans_differ(const span_t a, const span_t b) {
     return a.file != b.file || a.line != b.line || a.column != b.column || a.length != b.length;
 }
 
+static int node_contracts_differ(const dagnode_t *a, const dagnode_t *b) {
+    return a->op_class != b->op_class || a->declared != b->declared || a->lane != b->lane
+           || a->promise != b->promise || a->stated_by_binding != b->stated_by_binding
+           || a->bless != b->bless;
+}
+
 static int dagnode_differs(const dagnode_t *a, const dagnode_t *b) {
     if (a->op != b->op || a->input_count != b->input_count || a->carried != b->carried
-        || a->tick_of != b->tick_of) {
+        || a->step_end != b->step_end || a->tick_of != b->tick_of) {
         return 1;
     }
     for (int k = 0; k < DAG_MAX_INPUTS; k++) {
@@ -459,7 +465,7 @@ static int dagnode_differs(const dagnode_t *a, const dagnode_t *b) {
             return 1;
         }
     }
-    if (a->op_class != b->op_class || a->declared != b->declared || a->lane != b->lane) {
+    if (node_contracts_differ(a, b)) {
         return 1;
     }
     if (spans_differ(a->span, b->span) || spans_differ(a->declared_span, b->declared_span)) {
@@ -468,7 +474,7 @@ static int dagnode_differs(const dagnode_t *a, const dagnode_t *b) {
     if (memcmp(&a->constant, &b->constant, sizeof a->constant) != 0) {
         return 1;
     }
-    if (a->binary_operator != b->binary_operator || a->bless != b->bless) {
+    if (a->binary_operator != b->binary_operator) {
         return 1;
     }
     return a->uses != b->uses || a->reached != b->reached
@@ -477,6 +483,9 @@ static int dagnode_differs(const dagnode_t *a, const dagnode_t *b) {
 }
 
 static int graph_differs_from(dag_t *dag, const dagnode_t *snapshot, const int count) {
+    if (dag_count(dag) != count) {
+        return 1;
+    }
     for (int i = 0; i < count; i++) {
         if (dagnode_differs(&snapshot[i], dag_at(dag, i))) {
             return 1;

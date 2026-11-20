@@ -21,7 +21,6 @@
 #include "resolve.h"
 #include "status.h"
 
-#include <ctype.h>
 #include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -37,8 +36,6 @@
 #define NAME_BYTES 256
 
 #define PATH_BYTES 1024
-
-#define LINE_BYTES 512
 
 #define FIELD_BYTES 16
 
@@ -65,21 +62,15 @@ typedef enum {
 typedef struct {
     want_t want;
 
-    char bad_verdict[FIELD_BYTES];
-
-    char bad_key[FIELD_BYTES];
-
-    int dropped_directive;
-
     char computed[FIELD_BYTES];
 
     char demanded[FIELD_BYTES];
 
-    char kernels[MAX_EXPECTED_KERNELS][KERNEL_NAME_BYTES];
+    const char *kernels[MAX_EXPECTED_KERNELS];
 
     int kernel_count;
 
-    char forbidden_kernels[MAX_EXPECTED_KERNELS][KERNEL_NAME_BYTES];
+    const char *forbidden_kernels[MAX_EXPECTED_KERNELS];
 
     int forbidden_kernel_count;
 
@@ -91,9 +82,9 @@ typedef struct {
 
     char ungrounded_nodes[FIELD_BYTES];
 
-    char diagnostic[MESSAGE_FIELD_BYTES];
+    const char *diagnostic;
 
-    char forbidden_diagnostic[MESSAGE_FIELD_BYTES];
+    const char *forbidden_diagnostic;
 } expect_t;
 
 typedef struct {
@@ -132,178 +123,147 @@ static void fail(const char *fixture, const char *fmt, ...) {
     fputc('\n', stderr);
 }
 
-static char *read_file(const char *path) {
-    FILE *stream = fopen(path, "rb");
-    if (!stream) {
-        return NULL;
-    }
-    if (fseek(stream, 0, SEEK_END) != 0) {
-        (void) fclose(stream); return NULL;
-    }
-    const long size = ftell(stream);
-    if (size < 0) {
-        (void) fclose(stream); return NULL;
-    }
-    rewind(stream);
-    char *text = (char *) malloc((size_t) size + 1);
-    if (!text) {
-        (void) fclose(stream); return NULL;
-    }
-    const size_t got = fread(text, 1, (size_t) size, stream);
-    text[got] = '\0';
-    (void) fclose(stream);
-    return text;
-}
-
-static void read_field(const char *line, const char *key, char *out, const size_t capacity) {
-    const char *at = strstr(line, key);
-    out[0] = '\0';
-    if (!at) {
-        return;
-    }
-    at += strlen(key);
-    size_t i = 0;
-    while (*at && *at != ' ' && *at != '\n' && i + 1 < capacity) {
-        out[i++] = *at++;
-    }
-    out[i] = '\0';
-}
-
 static int line_starts_with(const char *line, const char *prefix) {
     return strncmp(line, prefix, strlen(prefix)) == 0;
 }
 
-static const char *copy_line(const char *at, char *line, const size_t capacity) {
-    const char *newline = strchr(at, '\n');
-    size_t length = newline ? (size_t) (newline - at) : strlen(at);
-    if (length > capacity - 1) {
-        length = capacity - 1;
-    }
-    memcpy(line, at, length);
-    line[length] = '\0';
-    return newline ? newline + 1 : NULL;
-}
-
-static const char *const EXPECT_KEYS[] = {
-    "computed=", "demanded=", "primary=", "secondary=", "hops=", "ungrounded-nodes=",
-};
-
-static void find_unknown_key(const char *line, char *out, const size_t capacity) {
-    out[0] = '\0';
-    for (const char *at = line; *at; at++) {
-        if (*at != '=' || at == line) {
+static int store_expect_field(expect_t *expect, const char *token, const size_t width) {
+    const struct {
+        const char *key;
+        char *value;
+    } fields[] = {
+        {"computed=", expect->computed}, {"demanded=", expect->demanded},
+        {"primary=", expect->blame_primary}, {"secondary=", expect->blame_secondary},
+        {"hops=", expect->blame_hops}, {"ungrounded-nodes=", expect->ungrounded_nodes},
+    };
+    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+        const size_t key_length = strlen(fields[i].key);
+        if (width <= key_length || memcmp(token, fields[i].key, key_length) != 0) {
             continue;
         }
-        const char *start = at;
-        while (start > line && (isalnum((unsigned char) start[-1]) || start[-1] == '-')) {
-            start--;
+        const char *value = token + key_length;
+        const size_t length = width - key_length;
+        if (expect->want == WANT_MALFORMED ||
+            (expect->want == WANT_ACCEPT && fields[i].value != expect->ungrounded_nodes) ||
+            fields[i].value[0] || length >= FIELD_BYTES || memchr(value, '=', length)) {
+            return 0;
         }
-        if (start == at) {
-            continue;
-        }
-        const size_t length = (size_t) (at - start) + 1;
-        int known = 0;
-        for (size_t k = 0; k < sizeof EXPECT_KEYS / sizeof EXPECT_KEYS[0]; k++) {
-            known |= strlen(EXPECT_KEYS[k]) == length && strncmp(start, EXPECT_KEYS[k], length) == 0;
-        }
-        if (!known) {
-            const size_t copied = length < capacity - 1 ? length : capacity - 1;
-            memcpy(out, start, copied);
-            out[copied] = '\0';
-            return;
-        }
+        memcpy(fields[i].value, value, length);
+        fields[i].value[length] = '\0';
+        return 1;
     }
+    return 0;
 }
 
-static void parse_expect_verdict(const char *line, expect_t *expect) {
-    if (strstr(line, "accept")) {
-        expect->want = WANT_ACCEPT;
-    }
-    else if (strstr(line, "malformed")) {
-        expect->want = WANT_MALFORMED;
-    }
-    else if (strstr(line, "reject")) {
-        expect->want = WANT_REJECT;
-    }
-    else {
-        read_field(line, "EXPECT: ", expect->bad_verdict, sizeof expect->bad_verdict);
-        if (!expect->bad_verdict[0]) {
-            snprintf(expect->bad_verdict, sizeof expect->bad_verdict, "(empty)");
-        }
-    }
-
-    read_field(line, "computed=", expect->computed, sizeof expect->computed);
-    read_field(line, "demanded=", expect->demanded, sizeof expect->demanded);
-    read_field(line, "primary=", expect->blame_primary, sizeof expect->blame_primary);
-    read_field(line, "secondary=", expect->blame_secondary, sizeof expect->blame_secondary);
-    read_field(line, "hops=", expect->blame_hops, sizeof expect->blame_hops);
-    read_field(line, "ungrounded-nodes=", expect->ungrounded_nodes, sizeof expect->ungrounded_nodes);
-    find_unknown_key(line, expect->bad_key, sizeof expect->bad_key);
-}
-
-static void parse_expect_diagnostic(const char *line, const char *key, char *out) {
-    const char *at = strstr(line, key);
-    if (!at) {
-        return;
-    }
-    at += strlen(key);
-    while (*at == ' ') {
-        at++;
-    }
+static int parse_expect_verdict(const char *line, expect_t *expect, const char *fixture) {
+    const char *at = line + strspn(line, " \t\r");
+    size_t width = strcspn(at, " \t\r\n");
+    const size_t names = sizeof WANT_NAMES / sizeof WANT_NAMES[0];
     size_t i = 0;
-    while (*at && *at != '\n' && i + 1 < (size_t) MESSAGE_FIELD_BYTES) {
-        out[i++] = *at++;
+    while (i < names && (strlen(WANT_NAMES[i]) != width || memcmp(at, WANT_NAMES[i], width) != 0)) {
+        i++;
     }
-    while (i > 0 && (out[i - 1] == ' ' || out[i - 1] == '\r')) {
-        i--;
+    if (i == names) {
+        const int shown = (int) (width > FIELD_BYTES ? FIELD_BYTES : width);
+        fail(fixture, "unrecognised verdict '%.*s' on the // EXPECT: line", shown, at);
+        return 0;
     }
-    out[i] = '\0';
+    expect->want = (want_t) i;
+    for (;;) {
+        at += width;
+        at += strspn(at, " \t\r");
+        width = strcspn(at, " \t\r\n");
+        if (!width) {
+            return 1;
+        }
+        if (!store_expect_field(expect, at, width)) {
+            const int shown = (int) (width > MESSAGE_FIELD_BYTES ? MESSAGE_FIELD_BYTES : width);
+            fail(fixture, "invalid or repeated field '%.*s' on the // EXPECT: line", shown, at);
+            return 0;
+        }
+    }
 }
 
-static void parse_expect_kernel(
-    const char *line,
-    const char *key,
-    char list[][KERNEL_NAME_BYTES],
-    int *count
-) {
-    read_field(line, key, list[*count], KERNEL_NAME_BYTES);
-    if (list[*count][0]) {
-        (*count)++;
+static char *trim_value(char *value) {
+    value += strspn(value, " \t\r");
+    size_t length = strlen(value);
+    while (length && strchr(" \t\r", value[length - 1])) {
+        value[--length] = '\0';
     }
+    return value;
 }
 
-static int parse_expect(const char *source, expect_t *expect) {
+static int parse_assertion(char *key, expect_t *expect, const char *fixture) {
+    char *colon = strchr(key, ':');
+    if (!colon) {
+        fail(fixture, "missing ':' after fixture directive '%s'", key);
+        return 0;
+    }
+    *colon = '\0';
+    char *value = trim_value(colon + 1);
+    if (!*value) {
+        fail(fixture, "empty EXPECT-%s directive", key);
+        return 0;
+    }
+
+    const int forbidden = line_starts_with(key, "NO-");
+    const char *kind = forbidden ? key + strlen("NO-") : key;
+    if (strcmp(kind, "KERNEL") == 0) {
+        int *count = forbidden ? &expect->forbidden_kernel_count : &expect->kernel_count;
+        const char **names = forbidden ? expect->forbidden_kernels : expect->kernels;
+        if (strpbrk(value, " \t\r") || *count == MAX_EXPECTED_KERNELS) {
+            fail(fixture, "expected one kernel name and at most %d EXPECT-%s entries",
+                 MAX_EXPECTED_KERNELS, key);
+            return 0;
+        }
+        names[(*count)++] = value;
+        return 1;
+    }
+    if (strcmp(kind, "DIAGNOSTIC") == 0) {
+        const char **message = forbidden ? &expect->forbidden_diagnostic : &expect->diagnostic;
+        if (*message) {
+            fail(fixture, "repeated EXPECT-%s directive", key);
+            return 0;
+        }
+        *message = value;
+        return 1;
+    }
+    fail(fixture, "unrecognised EXPECT-%s directive", key);
+    return 0;
+}
+
+static int parse_expect(char *source, expect_t *expect, const char *fixture) {
     memset(expect, 0, sizeof *expect);
     int have = 0;
-    const char *at = source;
-
-    while (at && *at) {
-        char line[LINE_BYTES];
-        at = copy_line(at, line, sizeof line);
-
-        if (line_starts_with(line, "// EXPECT:")) {
-            parse_expect_verdict(line, expect);
-            have = 1;
-        } else if (line_starts_with(line, "// EXPECT-KERNEL:")) {
-            if (expect->kernel_count >= MAX_EXPECTED_KERNELS) {
-                expect->dropped_directive = 1;
-            }
-            else {
-                parse_expect_kernel(line, "EXPECT-KERNEL: ", expect->kernels, &expect->kernel_count);
-            }
-        } else if (line_starts_with(line, "// EXPECT-NO-KERNEL:")) {
-            if (expect->forbidden_kernel_count >= MAX_EXPECTED_KERNELS) {
-                expect->dropped_directive = 1;
-            }
-            else {
-                parse_expect_kernel(line, "EXPECT-NO-KERNEL: ", expect->forbidden_kernels,
-                                    &expect->forbidden_kernel_count);
-            }
-        } else if (line_starts_with(line, "// EXPECT-DIAGNOSTIC:")) {
-            parse_expect_diagnostic(line, "EXPECT-DIAGNOSTIC:", expect->diagnostic);
-        } else if (line_starts_with(line, "// EXPECT-NO-DIAGNOSTIC:")) {
-            parse_expect_diagnostic(line, "EXPECT-NO-DIAGNOSTIC:", expect->forbidden_diagnostic);
+    char *line = source;
+    while (line) {
+        char *next = strchr(line, '\n');
+        if (next) {
+            *next++ = '\0';
         }
+        char *directive = line + strspn(line, " \t");
+        line = next;
+        if (!line_starts_with(directive, "//")) {
+            continue;
+        }
+        directive += strlen("//");
+        directive += strspn(directive, " \t");
+        if (line_starts_with(directive, "EXPECT:")) {
+            if (have) {
+                fail(fixture, "more than one // EXPECT: line");
+                return 0;
+            }
+            if (!parse_expect_verdict(directive + strlen("EXPECT:"), expect, fixture)) {
+                return 0;
+            }
+            have = 1;
+        } else if (line_starts_with(directive, "EXPECT-") &&
+                   !parse_assertion(directive + strlen("EXPECT-"), expect, fixture)) {
+            return 0;
+        }
+    }
+    if (!have) {
+        fail(fixture, "no // EXPECT: line");
     }
     return have;
 }
@@ -340,7 +300,8 @@ static int check_resolved(const resolved_t *resolved, diagnostic_t *diagnostics,
     heal_program(resolved->dag, resolved->result);
 
     const int count = dag_count(resolved->dag);
-    lane_t *computed = (lane_t *) calloc((size_t) (count ? count : 1), sizeof(lane_t));
+    const size_t slots = count > 0 ? (size_t) count : 1;
+    lane_t *computed = calloc(slots, sizeof *computed);
     if (!computed) {
         return 0;
     }
@@ -529,6 +490,26 @@ static int check_kernels(const char *fixture, const expect_t *expect, const outc
     return ok;
 }
 
+static int check_diagnostics(const char *fixture, const expect_t *expect, const diagnostic_t *diagnostics) {
+    int ok = 1;
+    if (expect->diagnostic) {
+        cases++;
+        if (!diagnostic_message_contains(diagnostics, expect->diagnostic)) {
+            fail(fixture, "no diagnostic held \"%s\"", expect->diagnostic);
+            ok = 0;
+        }
+    }
+    if (expect->forbidden_diagnostic) {
+        cases++;
+        if (diagnostic_message_contains(diagnostics, expect->forbidden_diagnostic)) {
+            fail(fixture, "a diagnostic held \"%s\", which this fixture forbids",
+                 expect->forbidden_diagnostic);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
 static int check_expectation(
     const char *fixture,
     const expect_t *expect,
@@ -549,20 +530,8 @@ static int check_expectation(
             ok = 0;
         }
     }
-    if (expect->diagnostic[0]) {
-        cases++;
-        if (!diagnostic_message_contains(diagnostics, expect->diagnostic)) {
-            fail(fixture, "no diagnostic held \"%s\"", expect->diagnostic);
-            ok = 0;
-        }
-    }
-    if (expect->forbidden_diagnostic[0]) {
-        cases++;
-        if (diagnostic_message_contains(diagnostics, expect->forbidden_diagnostic)) {
-            fail(fixture, "a diagnostic held \"%s\", which this fixture forbids",
-                 expect->forbidden_diagnostic);
-            ok = 0;
-        }
+    if (!check_diagnostics(fixture, expect, diagnostics)) {
+        ok = 0;
     }
     if (!check_kernels(fixture, expect, outcome)) {
         ok = 0;
@@ -579,54 +548,47 @@ static int check_expectation(
     return ok;
 }
 
-static void run_one(const char *dir, const char *name) {
-    char path[PATH_BYTES];
-    snprintf(path, sizeof path, "%.700s/%.255s", dir, name);
-    char *source = read_file(path);
-    if (!source) {
-        fail(name, "cannot read");
-        return;
-    }
-
-    expect_t expect;
-    if (!parse_expect(source, &expect)) {
-        fail(name, "no // EXPECT: line");
-        free(source);
-        return;
-    }
-    if (expect.bad_verdict[0]) {
-        fail(name, "unrecognised verdict '%s' on the // EXPECT: line", expect.bad_verdict);
-        free(source);
-        return;
-    }
-    if (expect.dropped_directive) {
-        cases++;
-        fail(name, "more than %d kernel directives of one kind; the extra ones were read and not "
-                   "stored, so they assert nothing. Raise MAX_EXPECTED_KERNELS", MAX_EXPECTED_KERNELS);
-        free(source);
-        return;
-    }
-    if (expect.bad_key[0]) {
-        fail(name, "'%s' on the // EXPECT: line is not a field this suite reads, so it asserts "
-                   "nothing; the kernel directives are EXPECT-KERNEL: and EXPECT-NO-KERNEL: on "
-                   "their own lines", expect.bad_key);
-        free(source);
-        return;
-    }
-
+static void check_fixture(const char *path, const char *name, const char *source, const expect_t *expect) {
     diagnostic_t *diagnostics = diagnostic_new(path, source);
     outcome_t outcome;
-    if (!run_checker(path, source, diagnostics, &outcome)) {
+    if (!diagnostics || !run_checker(path, source, diagnostics, &outcome)) {
         fail(name, "out of memory");
         diagnostic_free(diagnostics);
-        free(source);
         return;
     }
 
-    const int ok = check_expectation(name, &expect, &outcome, diagnostics);
+    const int ok = check_expectation(name, expect, &outcome, diagnostics);
     printf("%-28s %-10s %s\n", name, WANT_NAMES[outcome.got], ok ? "ok" : "FAIL");
 
     diagnostic_free(diagnostics);
+}
+
+static void run_one(const char *dir, const char *name) {
+    char path[PATH_BYTES];
+    snprintf(path, sizeof path, "%.700s/%.255s", dir, name);
+    size_t nul_byte = 0;
+    char *source = parse_read_source(path, &nul_byte);
+    if (!source) {
+        if (nul_byte) {
+            fail(name, "NUL byte in fixture at byte %zu", nul_byte);
+        } else {
+            fail(name, "cannot read the whole fixture");
+        }
+        return;
+    }
+
+    const size_t bytes = strlen(source) + 1;
+    char *directives = malloc(bytes);
+    if (!directives) {
+        fail(name, "out of memory");
+    } else {
+        memcpy(directives, source, bytes);
+        expect_t expect;
+        if (parse_expect(directives, &expect, name)) {
+            check_fixture(path, name, source, &expect);
+        }
+        free(directives);
+    }
     free(source);
 }
 

@@ -26,8 +26,8 @@
 // allocation can fail for want of chunk room.
 #define ARENA_CHUNK_BYTES 8192
 
-// ARENA_ALIGNMENT is the byte alignment every arena allocation is rounded up to, which is
-// enough for every type stored in an arena here.
+// ARENA_ALIGNMENT is the multiple to which each allocation size is rounded. The first
+// allocation starts at the chunk's data field.
 #define ARENA_ALIGNMENT 16
 
 // MAX_PARAMETERS is how many parameters one declaration may have, gathered on the stack
@@ -85,12 +85,11 @@ typedef struct {
     // arena is where nodes are allocated from.
     arena_t *arena;
 
-    // failed is set once a failure has been reported, so that later failures stay quiet
-    // and the descent unwinds instead of guessing.
+    // failed records a parse or allocation failure. The parser discards the tree when
+    // this flag is set.
     int failed;
 
-    // depth is how many turns of the expression cycle are open; see
-    // LANELANG_MAX_EXPR_DEPTH.
+    // depth counts active expression parses and is bounded by LANELANG_MAX_EXPR_DEPTH.
     int depth;
 } parser_t;
 
@@ -103,10 +102,8 @@ void *arena_alloc(arena_t *arena, const size_t size);
 
 // parse_copy_to_arena copies `count` items into the arena and returns the copy.
 //
-// A count of zero returns NULL without reading `items`, so a caller with an empty list
-// gets NULL for two different reasons and must test the count, not the pointer. The
-// callers test `count > 0 && !copy`, except parse_finish, whose count is never zero
-// because parse_program refuses an empty program first.
+// An empty array returns NULL without reading `items`. For a positive count, NULL means
+// allocation failed.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes items (void) which is the array being copied.
@@ -132,7 +129,7 @@ int parse_accept(parser_t *parser, const token_kind_t kind);
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes kind (token_kind_t) which is the kind required.
-// Returns 1, or 0 after reporting a failure.
+// Returns 1 on a match or 0 if the token differs.
 int parse_expect(parser_t *parser, const token_kind_t kind);
 
 // parse_accept_keyword consumes the current token when it spells `keyword`.
@@ -146,26 +143,27 @@ int parse_accept_keyword(parser_t *parser, const char *keyword);
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
 // Takes keyword (char) which is the word required.
-// Returns 1, or 0 after reporting a failure.
+// Returns 1 on a match or 0 if the token differs.
 int parse_expect_keyword(parser_t *parser, const char *keyword);
 
 // parse_expr parses one expression, guarding the recursion depth.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Returns the expression, or NULL after reporting a failure.
+// Returns the expression or NULL on failure. The caller must also check the parser's
+// failure flag before using the completed tree.
 expr_t *parse_expr(parser_t *parser);
 
 // parse_bless reads an `@bless(...)` waiver at the cursor, consuming nothing when there
 // is none.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Returns 0 for absent, BLESS_PROMISE for a bare promise, or a checksum biased by one.
+// Returns 0 for an absent waiver, BLESS_PROMISE for a bare promise, or a checksum biased
+// by one. The caller checks the parser's failure flag before using the result.
 long long parse_bless(parser_t *parser);
 
-// qualifiers_t is a qualifier prefix: an optional grounding qualifier and an optional
-// lane, written bare and in that fixed order. `ungrounded replay Column` is the only
-// legal spelling and `replay ungrounded Column` is refused, so there is no ordering rule
-// for a reader to discover.
+// qualifiers_t holds an optional grounding qualifier followed by an optional lane. When
+// both are present, `ungrounded replay Column[Float]` follows this order and `replay
+// ungrounded Column[Float]` is refused.
 typedef struct {
     // lane is the demand written, or LANE_NONE.
     lane_t lane;
@@ -185,11 +183,15 @@ typedef struct {
 // which holds MAX_BINDINGS entries, stopping at `return`.
 //
 // It is shared by a function's body and a step function's braced body, so a binding means
-// the same in both.
+// the same in both. A name already bound in the body, or already one of its parameters,
+// is refused.
 //
 // Takes parser (parser_t) which is the parser's cursor and diagnostic sink.
-// Takes bindings (bind_t) which holds the bindings in scope.
-// Returns how many were read, or -1 after reporting a failure.
-int parse_bindings(parser_t *parser, bind_t *bindings);
+// Takes bindings (bind_t) which receives the bindings in source order.
+// Takes parameters (parameter_t) which holds the body's parameters.
+// Takes parameter_count (int) which is how many parameters the body has.
+// Returns how many were read, or -1 on failure.
+int parse_bindings(parser_t *parser, bind_t *bindings, const parameter_t *parameters,
+                   int parameter_count);
 
-#endif
+#endif  // LANELANG_PARSE_INTERNAL_H

@@ -16,10 +16,10 @@
 #define LANELANG_LEXER_H
 
 #include "diagnostic.h"
+#include "lane.h"
 
-// token_kind_t is what a token is. Almost every keyword has no kind of its own: the lexer
-// emits TK_IDENT for it and the parser decides, which keeps the grammar small. The lane
-// qualifiers are the exception, and TK_QUALIFIER says why.
+// token_kind_t identifies the kind of a token. The lexer emits TK_IDENT for most keywords
+// and lets the parser recognise them in context.
 typedef enum {
     // TK_EOF is the end of the source text. The lexer returns this indefinitely once it
     // is reached.
@@ -28,13 +28,9 @@ typedef enum {
     // TK_IDENT is an identifier, which is also how almost every keyword arrives.
     TK_IDENT,
 
-    // TK_QUALIFIER is `replay`, `exact`, `approx` or `ungrounded`: the four words that
-    // may prefix a value's name and state a fact about it. They are reserved and nothing
-    // else is, because left as identifiers they can be bound, and a demand then vanishes
-    // with no diagnostic: `replay := sum(x)` binds a variable called `replay`, states
-    // nothing, and selects the free kernel. A program that uses one of these words as a
-    // name does not compile. `lexer_token_is` matches this kind as well as TK_IDENT, so a
-    // parser asking whether a token spells a word need not know which kind carries it.
+    // TK_QUALIFIER marks a word reserved for a lane or grounding qualifier. Reserving
+    // these words lets the parser flag a missing name in `replay := sum(x)`. As an
+    // ordinary identifier, `replay` would name the sum and leave its kernel unpinned.
     TK_QUALIFIER,
 
     // TK_NUMBER is a numeric literal, whose value is in the token's `number` field.
@@ -86,16 +82,33 @@ typedef enum {
     // its body and appears nowhere else.
     TK_ARROW,
 
-    // TK_ERROR is a character the lexer does not recognise. The lexer has already
-    // reported it.
+    // TK_ERROR marks invalid input. The lexer reports the cause when it has a diagnostic
+    // sink.
     TK_ERROR
 } token_kind_t;
+
+// qualifier_word_t pairs a reserved spelling with its lane, if it states one.
+typedef struct {
+    // spelling is the word as it appears in source.
+    const char *spelling;
+
+    // lane is the stated lane. The grounding qualifier carries LANE_NONE.
+    lane_t lane;
+} qualifier_word_t;
+
+// LEXER_QUALIFIERS lists the reserved words in suggestion order. A NULL spelling ends the
+// table.
+extern const qualifier_word_t LEXER_QUALIFIERS[];
 
 // token_t is one token, together with the source text it came from and where that text
 // is.
 typedef struct {
     // kind is which token this is.
     token_kind_t kind;
+
+    // qualifier identifies a qualifier spelling even in the unreserved control build. It
+    // is NULL for every other spelling.
+    const qualifier_word_t *qualifier;
 
     // span is where the token's text lies in the source, for diagnostics.
     span_t span;
@@ -107,8 +120,7 @@ typedef struct {
     // length is how many bytes of `text` belong to this token.
     int length;
 
-    // number is the value of a numeric literal, valid when `kind` is TK_NUMBER and 0
-    // otherwise.
+    // number holds the value of a numeric literal. Read it only when `kind` is TK_NUMBER.
     double number;
 } token_t;
 
@@ -117,7 +129,7 @@ typedef struct {
     // source is the whole source text, borrowed and required to outlive the lexer.
     const char *source;
 
-    // file is the name of that source, copied into every span this lexer produces.
+    // file is the borrowed source name referenced by each span the lexer produces.
     const char *file;
 
     // cursor is where the next token will be read from, always within `source`.
@@ -129,8 +141,7 @@ typedef struct {
     // column is the byte offset of the cursor within its line, counted from 1.
     int column;
 
-    // diagnostics is where an unrecognised character is reported, or NULL to lex without
-    // reporting.
+    // diagnostics receives lexical errors, or is NULL to lex without reporting them.
     diagnostic_t *diagnostics;
 } lexer_t;
 
@@ -151,9 +162,7 @@ void lexer_init(lexer_t *lexer, const char *file, const char *source, diagnostic
 // Takes lexer (lexer_t) which is the token cursor.
 token_t lexer_next(lexer_t *lexer);
 
-// lexer_token_is reports whether the token's text equals `keyword` exactly. An identifier
-// or a lane qualifier can match, which are the two kinds a word arrives as; the caller
-// asks what a token spells and need not know which kind carries it.
+// lexer_token_is reports whether an identifier or qualifier spells `keyword` exactly.
 //
 // Takes token (token_t) which is the token under the cursor.
 // Takes keyword (char) which is the word to match.
